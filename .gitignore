@@ -1,0 +1,30 @@
+# 虚拟环境
+.venv/
+env/
+venv/
+ENV/
+
+# Python 缓存
+__pycache__/
+*.py[cod]
+*.so
+
+# 本地向量库
+chroma_db/
+faiss_index/
+
+# 配置文件（如果有敏感信息）
+config.py
+.env
+
+# IDE配置
+.idea/
+.vscode/
+
+# 操作系统文件
+.DS_Store
+Thumbs.db
+
+# 依赖文件（除了 pyproject.toml 和 requirements.txt 外，其他的类似 .uv 缓存可以忽略）
+.uv/
+uv.lock
