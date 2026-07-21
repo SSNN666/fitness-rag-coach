@@ -522,7 +522,8 @@ if prompt_input := st.chat_input("请输入你的健身问题..."):
     # 进度条（用 st.empty 替代 st.status，避免 React removeChild DOM 错误）
     # ================================================================
     with st.chat_message("assistant"):
-        _progress = st.empty()
+        with st.container(border=False):
+            _progress = st.empty()
 
         # Step 1: 实体抽取
         entities = FitnessRAGRetriever._extract_entities(prompt_input)
