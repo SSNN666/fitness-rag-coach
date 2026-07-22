@@ -9,9 +9,22 @@ __pycache__/
 *.py[cod]
 *.so
 
-# 本地向量库
+# 本地向量库 & 嵌入式数据库
 chroma_db/
 faiss_index/
+milvus.db/
+milvus_data/
+test_milvus.db/
+bm25_index.pkl
+
+# 项目备份
+*.tar.gz
+
+# 缓存 & 日志
+fact_cache.json
+pdf_ocr_cache.json
+gateway.log
+*.log
 
 # 配置文件（如果有敏感信息）
 config.py

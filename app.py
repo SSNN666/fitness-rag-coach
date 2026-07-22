@@ -270,15 +270,20 @@ PROMPT_GENERAL = """你是一个专业健身教练AI，会根据用户的身体�
 如果用户的问题与健身无关，请礼貌地引导回健身话题。不确定的内容请标注"建议进一步咨询专业教练"。
 """
 
-PROMPT_INJURY = """你是一个运动康复顾问AI。用户的问题涉及伤病、疼痛或体态异常，你必须严格遵循以下安全约束：
+PROMPT_INJURY = """你是一个运动康复顾问AI。用户问题涉及伤病、疼痛或体态异常。你必须严格按照「参考知识」作答。
 
-1. 只能在「参考知识」范围内给出建议。不得编造任何康复方案、恢复周期、用药建议或具体的负重数值。
-2. 如果参考知识不足以回答用户问题，必须明确回复："根据现有资料无法确定，强烈建议咨询骨科/康复科医生进行专业评估"。
-3. 凡是知识库中标注为"禁忌动作"的内容，必须优先采纳并明确告知用户避免。
-4. 可以推荐知识库中标注为"康复动作"的训练，但需说明动作要领和安全边界。
-5. 以下是知识库明确标记的「绝对禁忌」动作/器械，严禁以任何形式出现在回答中（包括任何变式、替代、或"轻重量"版本）：
+=== 回答结构（三部分，缺一不可）===
+1.【基于知识的建议】— 每条建议必须在「参考知识」中有原文依据。引用具体动作名/禁忌/肌群。
+2.【知识库外推断】— 你的合理推断，必须标注「此为一般性推断，因人而异」。
+3.【需要就医的情况】— 明确指出哪些情况必须咨询骨科/康复科医生。
+
+=== 核心约束（违反即错误）===
+- 第1部分禁止编造「参考知识」中未出现的动作名称、康复周期天数、具体负重公斤数。
+- 如果「参考知识」资料不足，回复"现有资料不足以制定完整安全方案，建议咨询专业医师"，禁止拼凑虚假方案。
+- 「绝对禁忌」中的动作/器械严禁以任何形式出现（含变式、替代、"轻重量"版本）。
+
+=== 绝对禁忌 ===
 {contraindications}
-6. 如果无法在排除所有禁忌动作后给出完整方案，必须如实告知用户"现有资料不足以制定完整安全方案，请咨询医生"，禁止拼凑包含禁忌动作的虚假方案。
 
 用户画像：
 {user_profile}
@@ -287,17 +292,21 @@ PROMPT_INJURY = """你是一个运动康复顾问AI。用户的问题涉及伤�
 {context}
 """
 
-PROMPT_PLAN = """你是一个健身计划制定AI。请根据用户画像和参考知识，为用户制定个性化的训练计划。
+PROMPT_PLAN = """你是健身计划制定AI。你必须仅基于「参考知识」制定训练计划。
 
-硬性约束：
-1. 具体动作、组数、频率、进退阶建议必须在参考知识中找到依据。
-2. 无法从知识库验证的推断（如"预计X周见效"、"可提升Y%力量"），必须标注「此为一般性估计，因人而异」。
-3. 如果用户画像中包含伤病信息，自动切换到安全优先模式：优先排除禁忌动作，以康复和低风险训练为主。
-4. 计划应包含：训练频率、每次训练的动作列表、组数和次数范围、以及注意事项。
-5. 以下是知识库明确标记的「绝对禁忌」动作/器械，严禁以任何形式出现在计划中（包括任何变式或替代版本）：
+=== 计划结构（三部分，缺一不可）===
+1.【可验证部分】— 每个动作、组数、频率必须在「参考知识」中有原文依据。
+2.【推断部分】— 标注「以下为一般性推断，因人而异」。
+3.【安全声明】— 列出所有假设和限制条件。
+
+=== 硬性约束 ===
+- 禁止编造「参考知识」中不存在的动作名称。
+- 用户指定的器械类型必须严格遵守，禁止擅自替换。
+- 「绝对禁忌」中的动作严禁以任何形式出现（含变式、替代版本）。
+- 无法在排除禁忌后生成完整计划时，回复"现有资料不足，请咨询专业教练"，禁止拼凑方案。
+
+=== 绝对禁忌 ===
 {contraindications}
-6. 必须严格遵循用户指定的器械类型（如"只用固定器械"）。若用户指定器械与安全动作冲突，如实告知限制，禁止用自由重量替代。
-7. 若无法在排除禁忌+满足器械要求后生成完整四周计划，如实告知"现有资料不足以制定完整安全方案"，禁止拼凑包含高危动作的虚假方案。
 
 用户画像：
 {user_profile}
@@ -313,8 +322,48 @@ prompt = ChatPromptTemplate.from_messages([
     ("human", "{question}")
 ])
 
-def format_docs(docs):
-    return "\n\n".join(doc.page_content for doc in docs)
+def format_docs(docs, max_docs: int = 5, max_chars: int = 2400):
+    """
+    组装检索上下文：截断到 max_docs 条，总字数不超过 max_chars。
+    优先保留含实体标签（CSV 动作条目）的文档。
+    """
+    # 优先 CSV 来源（有结构化元数据）→ PDF 来源
+    csv_docs = [d for d in docs if d.metadata.get("source") == "fitness_data.csv"]
+    pdf_docs = [d for d in docs if d.metadata.get("source") != "fitness_data.csv"]
+    ordered = csv_docs + pdf_docs
+    ordered = ordered[:max_docs]
+
+    parts = []
+    total = 0
+    for doc in ordered:
+        text = _summarize_chunk(doc)
+        if total + len(text) > max_chars:
+            remaining = max_chars - total
+            if remaining > 50:
+                parts.append(text[:remaining] + "...")
+            break
+        parts.append(text)
+        total += len(text)
+    return "\n\n---\n".join(parts)
+
+
+def _summarize_chunk(doc) -> str:
+    """对单个 chunk 做轻量摘要：CSV 来源提取结构化字段，PDF 截断。"""
+    meta = doc.metadata
+    if meta.get("动作名称"):
+        # CSV 动作条目 → 结构化摘要
+        header = f"[{meta['动作名称']}]"
+        if meta.get("目标肌群"):
+            header += f" 肌群:{meta['目标肌群']}"
+        if meta.get("器械"):
+            header += f" 器械:{meta['器械']}"
+        if meta.get("难度"):
+            header += f" 难度:{meta['难度']}"
+        return header
+    else:
+        # PDF → 截断到前 150 字
+        text = doc.page_content.replace("\n", " ")
+        return text[:150] + ("..." if len(text) > 150 else "")
 
 if "store" not in st.session_state:
     st.session_state.store = {}
@@ -515,181 +564,142 @@ if prompt_input := st.chat_input("请输入你的健身问题..."):
     import config as _cfg
     from retriever import FitnessRAGRetriever
 
-    # 清除上轮 CRAG 缓存，避免引用串用
+    # 清除上轮 CRAG 缓存
     st.session_state["_crag_results"] = []
 
     # ================================================================
-    # 进度条（用 st.empty 替代 st.status，避免 React removeChild DOM 错误）
+    # Phase 1: 全部后端处理（不产生任何 DOM 更新，= 0 次 removeChild）
     # ================================================================
-    with st.chat_message("assistant"):
-        with st.container(border=False):
-            _progress = st.empty()
+    entities = FitnessRAGRetriever._extract_entities(prompt_input)
+    st.session_state["_last_entities"] = entities
 
-        # Step 1: 实体抽取
-        entities = FitnessRAGRetriever._extract_entities(prompt_input)
-        st.session_state["_last_entities"] = entities
-        ent_summary = []
-        for etype in ["injury", "muscle", "equipment", "population", "body_part"]:
-            names = entities.get(etype, [])
-            if names:
-                ent_summary.append(f"{etype}:{'、'.join(names)}")
-        if ent_summary:
-            _progress.markdown(f"🔍 实体抽取：{' | '.join(ent_summary)[:120]}")
-        else:
-            _progress.markdown("🔍 实体抽取：未匹配到已知关键词")
+    selected_system_prompt = _select_prompt(prompt_input)
 
-        # Step 2: 路由选择
-        selected_system_prompt = _select_prompt(prompt_input)
-        if selected_system_prompt == PROMPT_INJURY:
-            _progress.markdown("🩺 路由：伤病诊断 → 图谱提权 + 安全约束 + 禁忌过滤")
-        elif selected_system_prompt == PROMPT_PLAN:
-            _progress.markdown("📋 路由：训练计划 → 知识库约束 + 动作溯源")
-        else:
-            _progress.markdown("💬 路由：普通问答 → 标准检索")
-
-        # Step 3: 查询 Neo4j 禁忌名单
-        injury_names = entities.get("injury", [])
-        forbidden_actions: list[str] = []
-        if injury_names:
-            _progress.markdown(f"🔗 查询图谱禁忌：{'、'.join(injury_names)}...")
-            contra_map = retriever.get_contraindications(injury_names)
-            if contra_map:
-                st.session_state["_contraindications_map"] = contra_map
-                for actions in contra_map.values():
-                    forbidden_actions.extend(actions)
-                forbidden_actions = list(set(forbidden_actions))
-                _progress.markdown(f"⚠️ 图谱命中 {len(forbidden_actions)} 个禁忌动作：{'、'.join(forbidden_actions[:8])}")
-                lines = ["\n\n【伤病禁忌黑名单 — 绝对禁止出现在回答中】"]
-                for inj, actions in contra_map.items():
-                    lines.append(f"- {inj}禁忌: {', '.join(actions)}")
-                st.session_state["_contraindications"] = "\n".join(lines)
-            else:
-                st.session_state["_contraindications_map"] = {}
-                st.session_state["_contraindications"] = "（该伤病在知识库中暂无禁忌记录）"
-                _progress.markdown("🔗 图谱中无该伤病禁忌记录")
+    # 查询 Neo4j 禁忌名单
+    injury_names = entities.get("injury", [])
+    forbidden_actions: list[str] = []
+    if injury_names:
+        contra_map = retriever.get_contraindications(injury_names)
+        if contra_map:
+            st.session_state["_contraindications_map"] = contra_map
+            for actions in contra_map.values():
+                forbidden_actions.extend(actions)
+            forbidden_actions = list(set(forbidden_actions))
+            lines = ["\n\n【伤病禁忌黑名单 — 绝对禁止出现在回答中】"]
+            for inj, actions in contra_map.items():
+                lines.append(f"- {inj}禁忌: {', '.join(actions)}")
+            st.session_state["_contraindications"] = "\n".join(lines)
         else:
             st.session_state["_contraindications_map"] = {}
-            st.session_state["_contraindications"] = "（当前查询无伤病，无需禁忌约束）"
+            st.session_state["_contraindications"] = "（该伤病在知识库中暂无禁忌记录）"
+    else:
+        st.session_state["_contraindications_map"] = {}
+        st.session_state["_contraindications"] = "（当前查询无伤病，无需禁忌约束）"
 
-        # Step 4: 边界拒绝检查
-        contra_action = _is_contraindicated_request(prompt_input, forbidden_actions)
-        if contra_action:
-            _progress.error(f"🚫 检测到核心诉求为禁忌动作「{contra_action}」→ 拒绝生成")
-            full_response = _reject_contraindicated_request(contra_action, injury_names)
-            full_response += _format_citations()
-            st.markdown(full_response)
-            st.session_state.messages.append({"role": "assistant", "content": full_response})
-            st.stop()
-
-        # Step 5: HyDE + 三路检索（提前执行，不在 chain 内）
-        if HYDE_ENABLED:
-            _progress.markdown("📝 HyDE 假想文档生成 + 三路检索...")
-            ctx = hyde_retrieve(prompt_input, llm, retriever)
-        else:
-            _progress.markdown("🔍 三路检索：Milvus + BM25 + Neo4j...")
-            docs = retriever.invoke(prompt_input)
-            ctx = format_docs(docs)
-
-        # 存储引用来源
-        try:
-            _cite_docs = retriever.invoke(prompt_input)
-            st.session_state["_last_docs"] = _cite_docs[:5]
-        except Exception:
-            st.session_state["_last_docs"] = []
-
-        # 禁忌注入上下文
-        contra_text = st.session_state.get("_contraindications", "")
-        if contra_text and "暂无" not in contra_text and "无需" not in contra_text:
-            ctx = contra_text + "\n" + ctx
-
-        # Step 6: 知识盲区 → CRAG（三层触发：未知伤病/上下文过短/外部知识关键词）
-        _ext_kws = ["争议","研究","最新","指南","学界","临床","文献","证据","进展","共识","综述","急性期","慢性期","恢复期","术后","膨出","脱出","游离","哪个医院","手术"]
-        knowledge_gap = bool(injury_names and not st.session_state.get("_contraindications_map"))
-        ctx_short = len(ctx) < 200
-        needs_external = any(kw in prompt_input for kw in _ext_kws)
-        if knowledge_gap or (injury_names and ctx_short) or (injury_names and needs_external):
-            _progress.markdown("🌐 知识库数据不足，尝试联网搜索...")
-            crag_ctx = None
-            if getattr(_cfg, 'CRAG_ENABLED', True):
-                try:
-                    import requests as _req
-                    _search_q = build_search_query(prompt_input, [])
-                    _resp = _req.post("https://api.bochaai.com/v1/web-search",
-                        headers={"Content-Type":"application/json","Authorization":"Bearer sk-fd46e722a04749f6b6d758317fa535fc"},
-                        json={"query":_search_q,"count":5}, timeout=5)
-                    _resp.raise_for_status()
-                    _data = _resp.json()
-                    _pages = _data.get("data",{}).get("webPages",{}).get("value",[])
-                    _crag_raw = [{"title":p.get("name",""),"snippet":p.get("snippet",""),"url":p.get("url","")} for p in _pages if p.get("snippet","").strip()]
-                    st.session_state["_crag_results"] = _crag_raw
-                    crag_ctx = format_search_results(_crag_raw) if _crag_raw else None
-                except Exception:
-                    pass
-
-            if crag_ctx:
-                _progress.markdown("🌐 联网搜索完成，整合外部资料...")
-                ctx = f"[联网检索资料]\n{crag_ctx}\n\n[本地知识库]\n{ctx}"
-                st.session_state["_crag_sources"] = crag_ctx
-            else:
-                _progress.markdown("🌐 联网不可用，知识库数据有限...")
-
-        # 存储最终的 context
-        st.session_state["_last_context"] = ctx
-        st.session_state["_forbidden_actions"] = forbidden_actions
-
-        # Step 7: 构建 chain（用预检索的 context）
-        _progress.markdown("🤔 准备生成回答...")
-        contra_text_final = st.session_state.get("_contraindications", "（无）")
-        chat_prompt = ChatPromptTemplate.from_messages([
-            ("system", selected_system_prompt),
-            MessagesPlaceholder(variable_name="history"),
-            ("human", "{question}"),
-        ]).partial(contraindications=contra_text_final)
-
-        # 用预检索 context 的简化 chain
-        def _precomputed_context(_d):
-            return ctx
-        rag_chain = (
-            RunnablePassthrough.assign(context=_precomputed_context)
-            | chat_prompt
-            | llm
-            | StrOutputParser()
-        )
-        chain = RunnableWithMessageHistory(
-            rag_chain, get_session_history,
-            input_messages_key="question", history_messages_key="history",
-        )
-
-        # Step 8: 流式生成
-        reranker_active = getattr(_cfg, 'RERANKER_ENABLED', False)
-        _progress.markdown(f"✍️ 正在生成回答（{'Rerank + ' if reranker_active else ''}qwen2.5:7b）...")
-
-        response_placeholder = st.empty()
-        full_response = ""
-        for chunk in chain.stream(
-            input_data,
-            config={"configurable": {"session_id": session_id}}
-        ):
-            full_response += chunk
-            response_placeholder.markdown(full_response + " ▌")
-
-        # Step 9: 硬过滤
-        full_response, was_filtered = _hard_filter_contraindications(full_response, forbidden_actions)
-        if was_filtered:
-            _progress.markdown("🛡️ 安全拦截：已自动剔除禁忌动作")
-
-        # Step 10: Fact-Check
-        if _needs_fact_check(prompt_input):
-            _progress.markdown("✅ 正在校验：四类事实检查（动作/康复/负重/禁忌）...")
-            full_response = _run_fact_check(prompt_input, full_response)
-            _progress.markdown("✅ 事实校验完成")
-
-        # Step 11: 引用来源
-        docs_count = len(st.session_state.get("_last_docs", []))
-        _progress.markdown(f"📚 附加 {docs_count} 条参考来源")
+    # 边界拒绝检查
+    contra_action = _is_contraindicated_request(prompt_input, forbidden_actions)
+    if contra_action:
+        full_response = _reject_contraindicated_request(contra_action, injury_names)
         full_response += _format_citations()
-        response_placeholder.markdown(full_response)
+        with st.chat_message("assistant"):
+            st.markdown(full_response)
+        st.session_state.messages.append({"role": "assistant", "content": full_response})
+        st.stop()
 
-        _progress.empty()
+    # HyDE + 三路检索
+    if HYDE_ENABLED:
+        ctx = hyde_retrieve(prompt_input, llm, retriever)
+    else:
+        docs = retriever.invoke(prompt_input)
+        ctx = format_docs(docs)
+
+    # 引用来源
+    try:
+        _cite_docs = retriever.invoke(prompt_input)
+        st.session_state["_last_docs"] = _cite_docs[:5]
+    except Exception:
+        st.session_state["_last_docs"] = []
+
+    # 禁忌注入上下文
+    contra_text = st.session_state.get("_contraindications", "")
+    if contra_text and "暂无" not in contra_text and "无需" not in contra_text:
+        ctx = contra_text + "\n" + ctx
+
+    # 知识盲区 → CRAG
+    _ext_kws = ["争议","研究","最新","指南","学界","临床","文献","证据","进展","共识","综述","急性期","慢性期","恢复期","术后","膨出","脱出","游离","哪个医院","手术"]
+    knowledge_gap = bool(injury_names and not st.session_state.get("_contraindications_map"))
+    ctx_short = len(ctx) < 200
+    needs_external = any(kw in prompt_input for kw in _ext_kws)
+    if knowledge_gap or (injury_names and ctx_short) or (injury_names and needs_external):
+        crag_ctx = None
+        if getattr(_cfg, 'CRAG_ENABLED', True):
+            try:
+                import requests as _req
+                _search_q = build_search_query(prompt_input, [])
+                _resp = _req.post("https://api.bochaai.com/v1/web-search",
+                    headers={"Content-Type":"application/json","Authorization":"Bearer sk-fd46e722a04749f6b6d758317fa535fc"},
+                    json={"query":_search_q,"count":5}, timeout=5)
+                _resp.raise_for_status()
+                _data = _resp.json()
+                _pages = _data.get("data",{}).get("webPages",{}).get("value",[])
+                _crag_raw = [{"title":p.get("name",""),"snippet":p.get("snippet",""),"url":p.get("url","")} for p in _pages if p.get("snippet","").strip()]
+                st.session_state["_crag_results"] = _crag_raw
+                crag_ctx = format_search_results(_crag_raw) if _crag_raw else None
+            except Exception:
+                pass
+        if crag_ctx:
+            ctx = f"[联网检索资料]\n{crag_ctx}\n\n[本地知识库]\n{ctx}"
+            st.session_state["_crag_sources"] = crag_ctx
+
+    st.session_state["_last_context"] = ctx
+    st.session_state["_forbidden_actions"] = forbidden_actions
+
+    # 构建 chain
+    contra_text_final = st.session_state.get("_contraindications", "（无）")
+    chat_prompt = ChatPromptTemplate.from_messages([
+        ("system", selected_system_prompt),
+        MessagesPlaceholder(variable_name="history"),
+        ("human", "{question}"),
+    ]).partial(contraindications=contra_text_final)
+
+    def _precomputed_context(_d):
+        return ctx
+    rag_chain = (
+        RunnablePassthrough.assign(context=_precomputed_context)
+        | chat_prompt
+        | llm
+        | StrOutputParser()
+    )
+    chain = RunnableWithMessageHistory(
+        rag_chain, get_session_history,
+        input_messages_key="question", history_messages_key="history",
+    )
+
+    # ================================================================
+    # Phase 2: 回答展示（st.spinner + 单次 st.markdown，0 次 removeChild）
+    # ================================================================
+    with st.chat_message("assistant"):
+        with st.spinner("正在生成回答..."):
+            # 收集完整响应（不流式写 DOM，避免前端 removeChild 竞态）
+            full_response = ""
+            for chunk in chain.stream(
+                input_data,
+                config={"configurable": {"session_id": session_id}}
+            ):
+                full_response += chunk
+
+            # 硬过滤
+            full_response, was_filtered = _hard_filter_contraindications(full_response, forbidden_actions)
+            if was_filtered:
+                full_response += "\n\n🛡️ [安全拦截：已自动剔除禁忌动作]"
+
+            # Fact-Check
+            if _needs_fact_check(prompt_input):
+                full_response = _run_fact_check(prompt_input, full_response)
+
+            # 引用来源
+            full_response += _format_citations()
+
+        st.markdown(full_response)
 
     st.session_state.messages.append({"role": "assistant", "content": full_response})

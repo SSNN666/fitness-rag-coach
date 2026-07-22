@@ -1,0 +1,373 @@
+"""
+评测脚本：对 test_100_full.csv 计算 Hit@k / MRR / RAGAS 指标
+不依赖 ragas 库，直接用 LLM 做 faithfulness / relevancy / context 评判
+
+用法：
+  python eval_testset.py           # 原始朴素检索（baseline）
+  python eval_testset.py --hyde    # 启用 HyDE 假想文档检索
+"""
+import gc
+import os
+import sys
+import time
+import json
+import numpy as np
+import pandas as pd
+from config import *
+from langchain_ollama import ChatOllama, OllamaEmbeddings
+from langchain_core.prompts import ChatPromptTemplate
+from langchain_core.output_parsers import StrOutputParser
+from pymilvus import MilvusClient
+from neo4j import GraphDatabase
+from hyde import generate_hypothetical_doc, classify_query, hyde_retrieve, multi_query_retrieve
+from retriever import FitnessRAGRetriever, load_bm25_from_pickle
+
+# 限制 Ollama 并发 + 上下文窗口（防止 Windows OOM 死机）
+os.environ.setdefault("OLLAMA_NUM_PARALLEL", "1")
+os.environ.setdefault("OLLAMA_MAX_LOADED_MODELS", "2")
+
+USE_HYDE = "--hyde" in sys.argv
+
+
+# -- 加载组件 ----------------------------------------------
+embeddings = OllamaEmbeddings(model=EMBEDDING_MODEL, num_ctx=OLLAMA_NUM_CTX, num_thread=OLLAMA_NUM_THREAD)
+
+# Milvus Lite（与 app.py 一致）
+milvus_client = MilvusClient(uri=MILVUS_URI)
+milvus_client.load_collection(MILVUS_COLLECTION)  # 加载到内存（默认 released）
+
+# BM25
+bm25_idx, bm25_docs = load_bm25_from_pickle(BM25_INDEX_PATH)
+
+# Neo4j
+neo4j_driver = GraphDatabase.driver(NEO4J_URI, auth=(NEO4J_USER, NEO4J_PASSWORD))
+
+def _embed_fn(text: str):
+    return embeddings.embed_query(text)
+
+# Reranker（复用已有 LLM，temperature=0 确保确定性排序）
+_eval_reranker = None
+if RERANKER_ENABLED:
+    from reranker import FitnessReranker
+    _reranker_llm = ChatOllama(model=RERANK_MODEL, temperature=0,
+                               num_ctx=OLLAMA_NUM_CTX, num_thread=OLLAMA_NUM_THREAD)
+    _eval_reranker = FitnessReranker(
+        llm=_reranker_llm,
+        max_candidates=RERANKER_MAX_CANDIDATES,
+        doc_max_chars=RERANKER_DOC_MAX_CHARS,
+    )
+    print(f"[INFO] Reranker 已启用 (listwise LLM)")
+
+retriever = FitnessRAGRetriever(
+    milvus_client=milvus_client,
+    bm25_index=(bm25_idx, bm25_docs),
+    neo4j_driver=neo4j_driver,
+    embedding_fn=_embed_fn,
+    w_milvus=FUSION_WEIGHT_MILVUS,
+    w_bm25=FUSION_WEIGHT_BM25,
+    w_neo4j=FUSION_WEIGHT_NEO4J,
+    fusion_threshold=FUSION_THRESHOLD,
+    reranker=_eval_reranker,
+    milvus_factor=RERANK_MILVUS_FACTOR if RERANKER_ENABLED else 3,
+    bm25_factor=RERANK_BM25_FACTOR if RERANKER_ENABLED else 3,
+    neo4j_factor=RERANK_NEO4J_FACTOR if RERANKER_ENABLED else 2,
+    neo4j_depth=NEO4J_DEPTH,
+    neo4j_max_depth=NEO4J_MAX_DEPTH,
+)
+# 主 LLM（生成回答用，限制输出长度减少内存压力）
+llm = ChatOllama(model=LLM_MODEL, temperature=0, num_predict=256,
+               num_ctx=OLLAMA_NUM_CTX, num_thread=OLLAMA_NUM_THREAD)
+# 判分 LLM（只需输出 "0" 或 "1"，token 数压到最低）
+judge_llm = ChatOllama(model=LLM_MODEL, temperature=0, num_predict=1,
+                     num_ctx=OLLAMA_NUM_CTX, num_thread=OLLAMA_NUM_THREAD)
+
+# HyDE 模式标记
+EVAL_MODE = "HyDE" if USE_HYDE else "ThreePath"
+
+
+def retrieve(query: str):
+    """根据模式分发检索：HyDE 增强 或 三路直接检索。"""
+    if USE_HYDE:
+        label = classify_query(query)
+        if label == "compound_injury":
+            return multi_query_retrieve(query, llm, retriever)
+        else:
+            hyde_doc = generate_hypothetical_doc(query, llm, label)
+            return retriever.similarity_search(hyde_doc, k=HYDE_TOP_K)
+    else:
+        return retriever.similarity_search(query, k=5)  # k=5 避免人为压低 recall
+
+df = pd.read_csv("test_100_full.csv")
+# --limit N 参数：仅使用前 N 条
+for i, arg in enumerate(sys.argv):
+    if arg == "--limit" and i + 1 < len(sys.argv):
+        df = df.head(int(sys.argv[i + 1]))
+print(f"[OK] Loaded {len(df)} test samples")
+
+
+# -- 余弦相似度 --------------------------------------------
+def cosine(a, b):
+    return np.dot(a, b) / (np.linalg.norm(a) * np.linalg.norm(b) + 1e-9)
+
+
+# -- 1) Hit@k & MRR ----------------------------------------
+SIM_THRESHOLD = 0.75
+
+def compute_retrieval_metrics():
+    k_list = (1, 3, 5)
+    hit = {k: 0 for k in k_list}
+    mrr_sum = 0
+
+    for i, row in df.iterrows():
+        docs = retrieve(row["query"])
+        ref_emb = np.array(embeddings.embed_query(row["reference_texts"]))
+        ranks = []
+        for j, doc in enumerate(docs):
+            doc_emb = np.array(embeddings.embed_query(doc.page_content))
+            if cosine(ref_emb, doc_emb) > SIM_THRESHOLD:
+                ranks.append(j + 1)
+        if ranks:
+            mrr_sum += 1.0 / ranks[0]
+            for k in k_list:
+                if any(r <= k for r in ranks):
+                    hit[k] += 1
+        if (i + 1) % 20 == 0:
+            print(f"  retrieval... {i+1}/{len(df)}")
+            gc.collect()
+            time.sleep(0.5)
+
+    return {
+        f"Hit@{k}": round(hit[k] / len(df), 4) for k in k_list
+    } | {"MRR": round(mrr_sum / len(df), 4)}
+
+
+# -- 2) RAGAS-style 指标（LLM as judge）---------------------
+
+FAITHFULNESS_PROMPT = ChatPromptTemplate.from_messages([
+    ("system", """你的任务是判断一个回答是否忠实于给定的上下文(context)。
+- 如果回答中的所有主张都能在上下文中找到依据，得 1 分
+- 如果回答中有编造的信息不在上下文中，得 0 分
+请只输出一个数字：1 或 0"""),
+    ("human", "上下文:\n{context}\n\n回答:\n{answer}\n\n分数:")
+])
+
+RELEVANCY_PROMPT = ChatPromptTemplate.from_messages([
+    ("system", """判断回答是否精准回应了用户问题。
+
+- 1分：回答完全切题，包含具体动作名/肌群/器械/伤病名等实体信息，不是泛泛而谈
+- 0分：回答偏离主题、答非所问、或过于笼统（如仅说"请咨询医生"而没有任何具体建议）
+
+只输出一个数字：1 或 0。"""),
+    ("human", "问题:\n{question}\n\n回答:\n{answer}\n\n分数:")
+])
+
+CONTEXT_PRECISION_PROMPT = ChatPromptTemplate.from_messages([
+    ("system", """判断检索到的上下文是否精确匹配用户问题。
+
+判定标准：
+- 1分：每条上下文都与问题直接相关（含匹配的肌群名/动作名/伤病名/器械名）
+- 0分：任一上下文与问题完全无关，或被无关内容主导（有效信息<50%）
+
+只输出一个数字：1 或 0。"""),
+    ("human", "问题:\n{question}\n\n检索到的上下文:\n{context}\n\n分数:")
+])
+
+CONTEXT_RECALL_PROMPT = ChatPromptTemplate.from_messages([
+    ("system", """你的任务是判断检索到的上下文是否包含了回答该问题所需的关键信息。
+- 如果上下文覆盖了 ground truth 中的核心要点，得 1 分
+- 如果上下文缺少 ground truth 中的关键信息，得 0 分
+请只输出一个数字：1 或 0"""),
+    ("human", "问题:\n{question}\n\n检索到的上下文:\n{context}\n\nGround Truth:\n{ground_truth}\n\n分数:")
+])
+
+faithfulness_chain = FAITHFULNESS_PROMPT | judge_llm | StrOutputParser()
+relevancy_chain = RELEVANCY_PROMPT | judge_llm | StrOutputParser()
+precision_chain = CONTEXT_PRECISION_PROMPT | judge_llm | StrOutputParser()
+recall_chain = CONTEXT_RECALL_PROMPT | judge_llm | StrOutputParser()
+
+answer_prompt = ChatPromptTemplate.from_messages([
+    ("system", "你是一个专业健身教练。请根据以下参考信息回答问题。\n\n参考信息：\n{context}"),
+    ("human", "{question}")
+])
+answer_chain = answer_prompt | llm | StrOutputParser()
+
+
+def parse_score(text):
+    try:
+        return int(text.strip()[0])
+    except:
+        return 0
+
+
+def compute_ragas():
+    scores = {"faithfulness": 0, "answer_relevancy": 0,
+              "context_precision": 0, "context_recall": 0}
+    total = len(df)
+
+    for i, row in df.iterrows():
+        # 检索 & 生成 - top 3 + 实体优选（匹配标签的文档排前面）
+        all_docs = retrieve(row["query"])
+        # 提取 query 实体用于优选
+        q_entities = set()
+        for etype, names in FitnessRAGRetriever._extract_entities(row["query"]).items():
+        	for n in names:
+        		q_entities.add(f"{etype}:{n}")
+        # 实体匹配的排前面（PDF 无标签时从 page_content 抽取）
+        def _doc_labels(doc):
+            labels = set(doc.metadata.get("entity_labels", []))
+            if not labels:
+                for etype, names in FitnessRAGRetriever._extract_entities(doc.page_content).items():
+                    for n in names:
+                        labels.add(f"{etype}:{n}")
+            return labels
+        if q_entities:
+            match_docs = [d for d in all_docs if q_entities & _doc_labels(d)]
+            other_docs = [d for d in all_docs if not (q_entities & _doc_labels(d))]
+            all_docs = match_docs + other_docs
+        docs = all_docs[:3]
+        parts = []
+        for doc in docs:
+            name = doc.metadata.get("动作名称", "")
+            if name:
+                muscles = doc.metadata.get("目标肌群", "")
+                equip = doc.metadata.get("器械", "")
+                parts.append("[{}] 肌群:{} 器械:{}".format(name, muscles, equip))
+            else:
+                parts.append(doc.page_content.replace('\n', ' ')[:120])
+        ctx = "\n".join(parts)
+        answer = answer_chain.invoke({"question": row["query"], "context": ctx})
+
+        # 4 个维度的 LLM 评判（用 num_predict=1 的轻量 judge_llm）
+        f = parse_score(faithfulness_chain.invoke({"context": ctx, "answer": answer}))
+        r = parse_score(relevancy_chain.invoke({"question": row["query"], "answer": answer}))
+        p = parse_score(precision_chain.invoke({"question": row["query"], "context": ctx}))
+        cr = parse_score(recall_chain.invoke({
+            "question": row["query"], "context": ctx, "ground_truth": row["ground_truth"]
+        }))
+
+        scores["faithfulness"] += f
+        scores["answer_relevancy"] += r
+        scores["context_precision"] += p
+        scores["context_recall"] += cr
+
+        # 每 10 条释放一次内存 + 短暂休息，防止 Windows OOM 死机
+        if (i + 1) % 10 == 0:
+            print(f"  ragas... {i+1}/{total} (f={f} r={r} p={p} cr={cr})")
+            gc.collect()
+            time.sleep(1.0)
+
+    return {k: round(v / total, 4) for k, v in scores.items()}
+
+
+# -- 3) 按题型分组 -----------------------------------------
+def compute_by_type(retrieval_scores_func):
+    """返回每种 question_type 的 Hit@3 和 MRR"""
+    results = {}
+    for qt in df["question_type"].unique():
+        subset = df[df["question_type"] == qt]
+        hit3 = 0; mrr_sum = 0
+        for _, row in subset.iterrows():
+            docs = retrieve(row["query"])
+            ref_emb = np.array(embeddings.embed_query(row["reference_texts"]))
+            ranks = []
+            for j, doc in enumerate(docs):
+                doc_emb = np.array(embeddings.embed_query(doc.page_content))
+                if cosine(ref_emb, doc_emb) > SIM_THRESHOLD:
+                    ranks.append(j + 1)
+            if ranks:
+                mrr_sum += 1.0 / ranks[0]
+                if any(r <= 3 for r in ranks):
+                    hit3 += 1
+        n = len(subset)
+        results[qt] = {"n": n, "Hit@3": round(hit3/n, 3), "MRR": round(mrr_sum/n, 3)}
+    return results
+
+
+# -- 4) 分类器验证 -----------------------------------------
+def validate_classifier():
+    """对比关键词分类器输出与数据集 question_type 标签。"""
+    # 数据集标签 → 分类器标签映射
+    mapping = {
+        "基础问答": "simple",
+        "单伤病问答": "single_injury",
+        "复合伤病问答": "compound_injury",
+        "动作纠错": "simple",
+        "计划生成": "simple",
+        "定制长计划": "compound_injury",  # 多约束 → 复合
+        "架构问答": "simple",
+        "评测原理": "simple",
+        "总结问答": "simple",
+    }
+    correct = 0
+    details = []
+    for _, row in df.iterrows():
+        predicted = classify_query(row["query"])
+        expected = mapping.get(row["question_type"], "simple")
+        if predicted == expected:
+            correct += 1
+        else:
+            details.append((row["question_type"], predicted, expected, row["query"][:40]))
+    return correct, len(df), details
+
+
+# -- 执行 --------------------------------------------------
+print(f"\n[INFO] 评测模式: {EVAL_MODE}")
+
+# 分类器验证（HyDE 模式时输出详情）
+if USE_HYDE:
+    correct, total, errors = validate_classifier()
+    print(f"\n[INFO] 分类器准确率: {correct}/{total} = {correct/total:.1%}")
+    if errors:
+        print(f"        误分类 ({len(errors)} 条):")
+        for qt, pred, exp, query in errors[:8]:
+            print(f"          [{qt}] pred={pred} exp={exp} | {query}...")
+        if len(errors) > 8:
+            print(f"          ... 及其他 {len(errors)-8} 条")
+
+t_start = time.time()
+
+print("\n[1/2] Computing Hit@k / MRR ...")
+t0 = time.time()
+retrieval = compute_retrieval_metrics()
+print(f"  [TIME] {time.time()-t0:.1f}s")
+
+print("\n[INFO] [2/2] 计算 RAGAS 指标（LLM-as-Judge，100条 × 5轮推理）...")
+t0 = time.time()
+ragas_scores = compute_ragas()
+print(f"  [TIME] {time.time()-t0:.1f}s")
+
+SKIP_GROUPS = "--skip-groups" in sys.argv
+if not SKIP_GROUPS:
+    print("\n[INFO] 按题型分组 Hit@3 / MRR ...")
+    type_results = compute_by_type(None)
+else:
+    type_results = {}
+    print("\n[INFO] 跳过分组统计 (--skip-groups)")
+
+# -- 汇总输出 ----------------------------------------------
+print("\n" + "=" * 70)
+print(f"                [RESULTS] 评测结果汇总 ({EVAL_MODE})")
+print("=" * 70)
+
+print(f"\n{'-'*50}")
+print(f"  {'指标':<28} {'得分':>8}")
+print(f"{'-'*50}")
+print(f"  {'Hit@1':<28} {retrieval['Hit@1']:>8.4f}")
+print(f"  {'Hit@3':<28} {retrieval['Hit@3']:>8.4f}")
+print(f"  {'Hit@5':<28} {retrieval['Hit@5']:>8.4f}")
+print(f"  {'MRR':<28} {retrieval['MRR']:>8.4f}")
+print(f"{'-'*50}")
+print(f"  {'faithfulness (忠实度)':<28} {ragas_scores['faithfulness']:>8.4f}")
+print(f"  {'answer_relevancy (相关性)':<28} {ragas_scores['answer_relevancy']:>8.4f}")
+print(f"  {'context_precision (上下文精度)':<28} {ragas_scores['context_precision']:>8.4f}")
+print(f"  {'context_recall (上下文召回)':<28} {ragas_scores['context_recall']:>8.4f}")
+print(f"{'-'*50}")
+
+print(f"\n\n{'-'*65}")
+print(f"  {'question_type':<16} {'n':>4}  {'Hit@3':>8}  {'MRR':>8}")
+print(f"{'-'*65}")
+for qt in sorted(type_results, key=lambda x: type_results[x]["Hit@3"], reverse=True):
+    d = type_results[qt]
+    print(f"  {qt:<16} {d['n']:>4}  {d['Hit@3']:>8.3f}  {d['MRR']:>8.3f}")
+print(f"{'-'*65}")
+print(f"\n  [TIME] 总耗时: {time.time()-t_start:.1f}s (模式: {EVAL_MODE})")

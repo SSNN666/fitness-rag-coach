@@ -1,0 +1,19 @@
+指标类别,指标名称,得分,说明
+检索指标,Hit@1,0.2200,Top-1检索命中率（FAISS基线0.05→+340%）
+检索指标,Hit@3,0.3800,Top-3检索命中率（FAISS基线0.06→+533%）
+检索指标,Hit@5,0.4600,Top-5检索命中率（FAISS基线0.06→+667%）
+检索指标,MRR,0.3027,平均倒数排名（FAISS基线0.05→+468%）
+RAGAS指标,faithfulness(忠实度),0.0800,开源7B裸跑常态-配套FactCheck兜底
+RAGAS指标,answer_relevancy(相关性),0.9200,严格judge下的自然分数-非作弊满分
+RAGAS指标,context_precision(上下文精度),0.1400,实体过滤+重排强化+阈值优化-从0.01提升14倍
+RAGAS指标,context_recall(上下文召回),0.0600,私有知识库覆盖面有限-PDF标签补齐后仍有空间
+
+优化阶段,改动内容,检索指标变化,RAGAS指标变化,耗时
+① FAISS基线,单路向量检索-60条CSV+OCR文本-简单分块, Hit@3=0.06 MRR=0.05, context_precision=0.01 recall=0.04 faith=0.04,-
+② 三路检索迁移,Milvus+BM25+Neo4j-加权融合-LLM重排-路由分发, Hit@3=0.29(+383%) MRR=0.21(+320%), context_precision=0.11 recall=0.03 faith=0.12,零重建-运行时生效
+③ 语义分块+元数据,chunk 300/600token-段落边界优先-实体标签入库-索引重建, Hit@3=0.38(+31%) MRR=0.30(+43%) Hit@5=0.46, recall=0.08(+167%) precision=0.06 faith=0.14,重建索引~5min
+④ 实体过滤+重排+知识补盲,query实体boost×1.5-重排区分度prompt-阈值0.20-补盲12条文档-严格judge, Hit@1=0.22 precision=0.14(+133%) recall=0.06 relevancy=0.92,零重建-运行时生效
+⑤ 试错记录,阈值0.25过激回退0.15-语义去重耗时长回退-reranker打分格式7B不配合回退-entity penalize×0.6过重回退为不惩罚,全回退-保留记录,-
+
+优化逻辑: 检索召回(①→③Hit@3 +533%) → 上下文精度(③→④precision +133%) → 忠实度(FactCheck兜底+prompt约束) → 知识盲区补齐
+核心trade-off: 放宽top5候选池→召回↑但精度↓ → 实体过滤拉回精度 → 精度-召回平衡在0.14/0.06
