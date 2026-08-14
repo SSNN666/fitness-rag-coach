@@ -14,7 +14,6 @@ import json
 import numpy as np
 import pandas as pd
 from config import *
-from langchain_ollama import ChatOllama, OllamaEmbeddings
 from langchain_core.prompts import ChatPromptTemplate
 from langchain_core.output_parsers import StrOutputParser
 from pymilvus import MilvusClient
@@ -27,36 +26,43 @@ os.environ.setdefault("OLLAMA_NUM_PARALLEL", "1")
 os.environ.setdefault("OLLAMA_MAX_LOADED_MODELS", "2")
 
 USE_HYDE = "--hyde" in sys.argv
+USE_RRF = "--rrf" in sys.argv          # 临时切 RRF 融合模式（与 weighted 对比用）
+USE_CLOUD = "--cloud" in sys.argv      # 评测用云端 LLM（默认本地 Ollama 防烧钱）
+EVAL_PROVIDER = "dashscope" if USE_CLOUD else EVAL_PROVIDER
 
 
 # -- 加载组件 ----------------------------------------------
-embeddings = OllamaEmbeddings(model=EMBEDDING_MODEL, num_ctx=OLLAMA_NUM_CTX, num_thread=OLLAMA_NUM_THREAD)
+from llm_adapter import build_embeddings
+embeddings = build_embeddings()  # 与线上一致（cloud/ollama 按 config）
 
 # Milvus Lite（与 app.py 一致）
-milvus_client = MilvusClient(uri=MILVUS_URI)
+milvus_client = MilvusClient(uri=MILVUS_URI, grpc_options=MILVUS_GRPC_OPTIONS)
 milvus_client.load_collection(MILVUS_COLLECTION)  # 加载到内存（默认 released）
 
 # BM25
 bm25_idx, bm25_docs = load_bm25_from_pickle(BM25_INDEX_PATH)
 
-# Neo4j
-neo4j_driver = GraphDatabase.driver(NEO4J_URI, auth=(NEO4J_USER, NEO4J_PASSWORD))
+# Neo4j（NEO4J_ENABLED=False 时停用 → driver 传 None，图谱路径返回空）
+if NEO4J_ENABLED:
+    neo4j_driver = GraphDatabase.driver(NEO4J_URI, auth=(NEO4J_USER, NEO4J_PASSWORD))
+else:
+    neo4j_driver = None
 
 def _embed_fn(text: str):
     return embeddings.embed_query(text)
 
-# Reranker（复用已有 LLM，temperature=0 确保确定性排序）
+# Reranker（统一适配器：EVAL_PROVIDER 默认本地 ollama，--cloud 切云端）
+from llm_adapter import build_llm, to_runnable
+
 _eval_reranker = None
 if RERANKER_ENABLED:
     from reranker import FitnessReranker
-    _reranker_llm = ChatOllama(model=RERANK_MODEL, temperature=0,
-                               num_ctx=OLLAMA_NUM_CTX, num_thread=OLLAMA_NUM_THREAD)
     _eval_reranker = FitnessReranker(
-        llm=_reranker_llm,
+        llm=build_llm("rerank", provider=EVAL_PROVIDER),
         max_candidates=RERANKER_MAX_CANDIDATES,
         doc_max_chars=RERANKER_DOC_MAX_CHARS,
     )
-    print(f"[INFO] Reranker 已启用 (listwise LLM)")
+    print(f"[INFO] Reranker 已启用 (listwise LLM, provider={EVAL_PROVIDER})")
 
 retriever = FitnessRAGRetriever(
     milvus_client=milvus_client,
@@ -73,13 +79,12 @@ retriever = FitnessRAGRetriever(
     neo4j_factor=RERANK_NEO4J_FACTOR if RERANKER_ENABLED else 2,
     neo4j_depth=NEO4J_DEPTH,
     neo4j_max_depth=NEO4J_MAX_DEPTH,
+    fusion_mode="rrf" if USE_RRF else None,
 )
-# 主 LLM（生成回答用，限制输出长度减少内存压力）
-llm = ChatOllama(model=LLM_MODEL, temperature=0, num_predict=256,
-               num_ctx=OLLAMA_NUM_CTX, num_thread=OLLAMA_NUM_THREAD)
-# 判分 LLM（只需输出 "0" 或 "1"，token 数压到最低）
-judge_llm = ChatOllama(model=LLM_MODEL, temperature=0, num_predict=1,
-                     num_ctx=OLLAMA_NUM_CTX, num_thread=OLLAMA_NUM_THREAD)
+# 统一适配器：主生成 / HyDE / 判分（本地 ollama 或 --cloud 云端）
+llm = build_llm("chat", provider=EVAL_PROVIDER, max_tokens=256)
+hyde_llm = build_llm("hyde", provider=EVAL_PROVIDER)
+judge_llm = to_runnable(build_llm("judge", provider=EVAL_PROVIDER, max_tokens=8))
 
 # HyDE 模式标记
 EVAL_MODE = "HyDE" if USE_HYDE else "ThreePath"
@@ -90,9 +95,9 @@ def retrieve(query: str):
     if USE_HYDE:
         label = classify_query(query)
         if label == "compound_injury":
-            return multi_query_retrieve(query, llm, retriever)
+            return multi_query_retrieve(query, hyde_llm, retriever)
         else:
-            hyde_doc = generate_hypothetical_doc(query, llm, label)
+            hyde_doc = generate_hypothetical_doc(query, hyde_llm, label)
             return retriever.similarity_search(hyde_doc, k=HYDE_TOP_K)
     else:
         return retriever.similarity_search(query, k=5)  # k=5 避免人为压低 recall
@@ -111,7 +116,11 @@ def cosine(a, b):
 
 
 # -- 1) Hit@k & MRR ----------------------------------------
-SIM_THRESHOLD = 0.75
+# 命中判定阈值：doc↔reference_texts 余弦。
+# 2026-08-14 随 Embedding 切换重校准（qwen3.7-text-embedding）：0.75 为 nomic 时代校准值，
+# qwen 嵌入下 doc↔ref 分离度不同，实测敏感度曲线 th=0.60 → Hit@3=0.40/MRR=0.352（与旧库持平），
+# th=0.75 → Hit@3=0.00（黄金对 query↔ref 平均 0.774，doc↔ref 更低一档）。切换 Embedding 供应商必须重校准此值。
+SIM_THRESHOLD = 0.60
 
 def compute_retrieval_metrics():
     k_list = (1, 3, 5)
@@ -189,7 +198,7 @@ answer_prompt = ChatPromptTemplate.from_messages([
     ("system", "你是一个专业健身教练。请根据以下参考信息回答问题。\n\n参考信息：\n{context}"),
     ("human", "{question}")
 ])
-answer_chain = answer_prompt | llm | StrOutputParser()
+answer_chain = answer_prompt | to_runnable(llm) | StrOutputParser()
 
 
 def parse_score(text):

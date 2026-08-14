@@ -1,73 +1,231 @@
-# 🏋️ AI 健身教练 — 三路检索 RAG + 知识图谱 + 本地 LLM
+# 🏋️ 康养知识库智能问答 RAG 系统
 
-基于检索增强生成（RAG）的智能健身与运动康复顾问。**Milvus 向量检索 + BM25 关键词 + Neo4j 知识图谱** 三路融合，搭配 HyDE 假想文档生成、Fact-Check 事实校验、CRAG 联网兜底。完全本地运行。
+基于检索增强生成（RAG）的康养问答 Demo：**FastAPI 唯一后端 + Streamlit SSE 客户端**，Milvus 向量 + BM25 关键词双路检索（Neo4j 图谱可插拔），统一大模型适配器（云端主链路 + 多供应商降级），HyDE 查询改写、拒答判定、Prompt 注入检测、内容审核、完整日志。
 
 ## ✨ 核心特性
 
-- **三路融合检索**：Milvus Lite 语义向量 + BM25 关键词 + Neo4j 知识图谱多跳推理，加权融合 + LLM 重排
-- **伤病安全防线**：Neo4j 禁忌动作图谱查询 → System Prompt 黑名单注入 → 硬性逐行过滤 → Fact-Check 四类校验
-- **HyDE 假想文档**：0.5B 小模型生成假设文档增强召回，复合伤病自动 Step-Back + 问题分解
-- **智能路由**：根据查询类型（普通/伤病/计划）动态切换检索权重和 System Prompt
-- **CRAG 联网搜索**：本地知识库不足时触发博查搜索，获取外部资料
-- **网关守护**：速率限制、请求降噪、令牌预算、内存自适应降级（7B→1.5B）
-- **完全离线**：Ollama 本地运行，无隐私泄露
+- **统一大模型适配器**：主链路阿里云百炼 DashScope（MaaS 部署 qwen3.7-plus，`DASHSCOPE_BASE_URL` 可切公共云/私有化），千帆 ERNIE 可选，本地 Ollama 兜底；超时/429 限流/额度不足/上下文超长自动分类 → 重试退避 → 降级链
+- **分层生成策略**：按查询复杂度分配模型与预算——简单问题快模型+短预算+跳过重排（约 8s），伤病/计划问题主模型+思考模式+校验（约 35s）；混合思考开关按角色配置（短回答类任务关思考提速 17 倍）
+- **双路检索 + 图谱可插拔**：Milvus Lite 语义向量 + BM25 关键词，RRF / 加权融合双模式可切换；Neo4j 伤病禁忌图谱默认停用、config 一键切回三路
+- **安全流水线（12 步）**：实体抽取 → 禁忌黑名单 → 边界拒绝 → HyDE 检索 → CRAG 补盲 → **拒答判定** → 分层 Prompt → 令牌预算 → 降级链生成 → 硬性过滤 → Fact-Check → 结构化引用
+- **禁忌数据双源降级**：Neo4j 图谱停机时自动切 [contra_data.py](contra_data.py) 本地副本（28 类伤病禁忌，与图谱构建共用单一数据源）——核心安全数据不依赖单一外部服务
+- **接口层防护**：X-API-Key 鉴权（演示级）、Prompt 注入检测（规则加权）、百度内容审核（输入/输出双向，fail-open）
+- **完整日志**：query / 检索片段 / prompt / 模型输出 / 报错 / token 消耗（JSON Lines，轮转）
+- **SSE 流式**：缓冲模式（审核先于展示）+ 引用/降级/token 元信息帧
+- **边界加固**：OCR 乱码质检（提分辨率重试→丢弃统计）、知识库无依据拒答、多模态 503 明确降级
 
 ## 🛠️ 技术栈
 
 | 层 | 组件 |
 |---|---|
-| LLM | Ollama: qwen2.5:7b (主生成) / 1.5b (校验) / 0.5b (HyDE) |
-| Embedding | nomic-embed-text (768d) |
-| 向量库 | Milvus Lite (嵌入式, 无需 Docker) |
-| 关键词 | BM25 (rank-bm25 + jieba) |
-| 知识图谱 | Neo4j AuraDB (伤病→禁忌/康复关系) |
-| UI | Streamlit |
-| 评估 | RAGAS (faithfulness/relevancy/precision/recall) |
+| 云端 LLM | DashScope（MaaS 私有部署，OpenAI 兼容模式）: qwen3.7-plus / qwen3.7-flash / qwen3-vl-plus |
+| 可选云 LLM | 百度千帆: ernie-4.5-turbo-128k / ernie-speed-128k（OpenAI 兼容 v2） |
+| 本地 LLM | Ollama: qwen2.5:7b（兜底）/ 1.5b（校验）/ 0.5b（HyDE） |
+| Embedding | qwen3.7-text-embedding（云端，768d 指定维度）+ nomic-embed-text（本地兜底） |
+| 向量库 | Milvus Lite（嵌入式，单进程独占） |
+| 关键词 | BM25（rank-bm25 + jieba） |
+| 知识图谱 | Neo4j AuraDB（伤病→禁忌/康复，默认停用可插拔） |
+| API | FastAPI + Pydantic + SSE；Streamlit（纯 API 客户端） |
+| 内容审核 | 百度智能云 text_censor/v2 |
+| 评估 | 自研 LLM-judge（Hit@k / MRR / faithfulness / relevancy / precision / recall） |
+
+## 🏗️ 架构
+
+```
+┌───────────────┐  POST /v1/chat/stream (SSE, X-API-Key)   ┌────────────────────────────────┐
+│  app.py       │ ───────────────────────────────────────▶ │  api.py (FastAPI 唯一后端)      │
+│  Streamlit    │ ◀─────────────────────────────────────── │  ├─ require_api_key 鉴权         │
+│  SSE 客户端    │   meta / delta* / citations / done /     │  ├─ 注入检测 + 百度输入审核       │
+│  (零索引/LLM   │   error                                 │  ├─ 网关: 限流/降噪/预算/内存降级  │
+│   依赖)       │                                          │  └─ /healthz /v1/chat /v1/vision │
+└───────────────┘                                          └───────────────┬────────────────┘
+                                                                          │ 单进程内（Milvus Lite 约束）
+                                                      ┌───────────────────▼───────────────────┐
+                                                      │ pipeline.py PipelineService（12 步）   │
+                                                      │  实体→禁忌(Neo4j可选)→边界拒绝→        │
+                                                      │  HyDE双路检索→CRAG→拒答→分层Prompt→    │
+                                                      │  预算守卫→生成→硬过滤→FactCheck→引用    │
+                                                      └───┬───────────────┬───────────────────┘
+                                            ┌─────────────▼──────┐  ┌─────▼──────────────────────┐
+                                            │ llm_adapter.py      │  │ retriever (Milvus+BM25      │
+                                            │ FallbackChain 降级链 │  │   +[Neo4j] weighted/RRF)    │
+                                            │  dashscope→qianfan?  │  └────────────────────────────┘
+                                            │  →ollama            │
+                                            └─────────────────────┘
+```
+
+**完整请求链路**：X-API-Key → Prompt 注入检测 → 百度输入审核（流式前）→ 网关限流/降噪 → 实体抽取 → Neo4j 禁忌名单（停用时安全跳过）→ 边界拒绝检查 → HyDE + 双路检索（加权/RRF 融合 + 实体 boost + LLM 重排）→ 知识盲区 CRAG 联网 → grounding 拒答判定（生成前）→ 分层 Prompt + 禁忌注入 → 令牌预算级联截断 → 降级链生成 → 硬性禁忌过滤 → Fact-Check 四类校验（缓存 + CRAG 修正）→ 百度输出审核（展示前）→ 结构化引用 → SSE 分块输出。
 
 ## 📦 安装
 
 ```bash
 uv venv && uv pip install -r requirements.txt
 ollama pull qwen2.5:7b qwen2.5:1.5b qwen2.5:0.5b nomic-embed-text
+cp .env.example .env   # 填入密钥（.env 不入库）
 ```
 
 ## 🚀 运行
 
-```bash
-python build_index.py --fast --skip-neo4j   # 构建索引
-streamlit run app.py                         # http://localhost:8501
-```
-
-## 📊 评估
+**一键启动（推荐）**：`python start.py`（或双击 `start.bat`）——自动拉起 API + UI、等健康检查就绪、打开浏览器；Ctrl+C 全部停止。
 
 ```bash
-python -u eval_testset.py --skip-groups --limit 50
+python start.py                  # 一键启动全部 + 自动开浏览器
+python start.py --no-browser     # 不开浏览器
+python start.py --skip-api       # 仅 UI（知识图谱页签可用）
 ```
 
-| 指标 | FAISS基线 → 最终 | 涨幅 |
+手动分步启动（调试用）：
+
+```bash
+# 1. 先启动 API（独占 Milvus Lite；禁用 --reload，reloader 会 fork 子进程导致文件锁冲突）
+uvicorn api:app --host 127.0.0.1 --port 8000
+
+# 2. 再启动 UI（纯 SSE 客户端）
+streamlit run app.py
+
+# 索引构建（Milvus Lite 单进程独占：重建索引/跑评测前需停 API 服务）
+python build_index.py --fast            # CSV + TEXT_KB_SOURCES 文本直抽 → Milvus + BM25
+python build_index.py --fast --source-dir <页面图片目录>   # 回退图片 OCR 路径（扫描件场景）
+```
+
+curl 冒烟：
+
+```bash
+curl http://127.0.0.1:8000/healthz
+curl -N -X POST http://127.0.0.1:8000/v1/chat/stream \
+  -H "X-API-Key: <你的API_KEY_AUTH>" -H "Content-Type: application/json" \
+  -d '{"question":"深蹲主要锻炼哪些肌群"}'
+```
+
+## 🔑 环境变量（.env）
+
+| 变量 | 用途 | 缺省行为 |
 |---|---|---|
-| Hit@3 | 0.06 → **0.38** | +533% |
-| MRR | 0.05 → **0.30** | +468% |
-| context_precision | 0.01 → **0.14** | +1300% |
-| context_recall | 0.04 → **0.06** | +50% |
-| answer_relevancy | 0.91 → **0.92** | 优质稳定 |
+| DASHSCOPE_API_KEY | 云端主链路（含 /v1/vision） | 跳过 DashScope，直接本地 Ollama |
+| QIANFAN_API_KEY | 可选第二云供应商（ERNIE） | 降级链自动跳过 |
+| BAIDU_AK / BAIDU_SK | 百度内容审核（text_censor/v2） | NullCensor 直通放行 + 日志标注 |
+| API_KEY_AUTH | 接口鉴权 Key（自定字符串） | 空 = 本地免鉴权 |
+| NEO4J_PASSWORD | Neo4j AuraDB（NEO4J_ENABLED=True 时） | — |
+| BOCHA_API_KEY | CRAG 联网搜索 | 联网补盲降级为无外部资料 |
 
-> 完整优化流程见 [eval_results_final.csv](eval_results_final.csv)
+## ⚡ 分层生成策略（按复杂度分配生成时间）
+
+| 层级 | 判定 | 模型 | 预算 | 重排 | 思考模式 | 实测耗时 |
+|---|---|---|---|---|---|---|
+| simple | 无伤病/体态/计划关键词 | qwen3.7-flash | 400 token + "200字内"提示 | 跳过 | 关 | **~8s**（原 42s） |
+| injury | 含伤病/体态实体 | qwen3.7-plus | 1024 token | ✓ | **默认关**（答后提示可开深度思考） | ~17s（含 Fact-Check） |
+| plan | 含计划类关键词 | qwen3.7-plus | 2048 token | ✓ | **默认关**（答后提示可开深度思考） | 按计划长度 |
+
+- **深度思考模式**：侧边栏开关 / API `deep_thinking` 字段——injury/plan 层默认快速（plus 关思考），开启后切思考模式（实测 17s → 43s，推理更深入）；simple 层不受影响
+- 快速模式回答后附加 💡 提示引导开启深度思考（仅 injury/plan 层）
+
+- `LLM_TIERS` 在 config 集中配置；重排/校验角色（rerank/fact_check/judge/hyde）全部关闭思考模式（实测 8.4s→0.5s）
+- 分层判定先于检索：simple 层跳过 LLM 重排，一次查询省一次模型调用
+- **并行化**：复合伤病三路召回草稿（HyDE/Step-Back/子问题）并行生成；管线两阶段——检索/共享状态锁内串行（Milvus Lite 约束），云端 LLM 生成锁外并行（实测 3 并发请求 1.3-1.6× 加速；封顶因素为 MaaS 单 Key 并发额度）
+- **Embedding 上云**：qwen3.7-text-embedding（dimensions=768 与 schema 一致，实测批量 41 条/s、8 并发 0.26s 无排队）——检索与本地资源解耦。⚠️ 切换 `EMBEDDING_PROVIDER` 必须重建索引（不同模型向量空间不兼容），并重新校准 `GROUNDING_MIN_SIM`（qwen 嵌入实测校准 0.40）
+- 快模型选型实测：qwen3.7-flash 优于 deepseek-v4-flash / glm-5.2-fast-preview（短任务 0.3s vs 0.9s）
+
+## 🔻 降级链触发条件
+
+| 错误分类 | 判定 | 处理 |
+|---|---|---|
+| TIMEOUT / 429 限流 / 5xx / 网络 | 异常类型 + 状态码 + 关键词 | 退避重试（默认 2 次）→ 下一级供应商 |
+| CONTEXT_OVERFLOW（上下文超长） | 错误消息关键词 | 截断历史（system+最后 user）重试一次 → 降级 |
+| QUOTA（欠费/额度不足） | Arrearage / 403 | **不盲目重试**，直接降级 |
+| AUTH（Key 无效） | 401 / InvalidApiKey | 直接降级 + ERROR 日志 |
+| 全部供应商失败 | — | 返回「服务暂时不可用」+ error_kind 标注 |
+
+链序：`dashscope → qianfan（配了 Key 才启用）→ ollama`。SSE done 帧 `fallback_active` + UI 横幅提示降级。
+
+## 🧪 测试
+
+```bash
+pytest -q tests/                    # 77 项：适配器降级链/注入/拒答/乱码/API 集成/引用清洗/拒绝原因/网关防护/图谱（mock 打桩）
+python -u eval_testset.py --skip-groups --limit 100   # 检索+生成评测（本地 Ollama）
+python -u eval_testset.py --rrf --limit 20            # RRF 融合模式对比
+python -u eval_testset.py --cloud --limit 20          # 云端评测（需 DASHSCOPE_API_KEY）
+```
+
+## 📊 评估（测试集重建后全量口径）
+
+> 2026-08-14：测试集重建（`rebuild_testset.py`，100 条全部锚定当前知识库内容，废弃旧系统元问题，
+> 旧版备份为 test_100_full_legacy.csv）+ `SIM_THRESHOLD` 随 Embedding 切换重校准 0.75→0.60。
+> 以下为 `python -u eval_testset.py --cloud` 全量 100 条（Neo4j 停用，官方口径 k=5）。
+
+| 指标 | 得分 | 备注 |
+|---|---|---|
+| Hit@1 / Hit@3 / Hit@5 | **0.51 / 0.62 / 0.65** | 测试集锚定 KB 后的检索命中率 |
+| MRR | **0.566** | |
+| faithfulness | 0.39 | LLM-judge 二元判定（严格） |
+| answer_relevancy | **0.90** | |
+| context_precision | 0.41 | |
+| context_recall | 0.46 | |
+
+按题型 Hit@3 / MRR：
+
+| 题型 | n | Hit@3 | MRR |
+|---|---|---|---|
+| 基础问答 | 30 | **1.00** | **1.00** |
+| 动作纠错 | 10 | **1.00** | **1.00** |
+| 计划生成 | 15 | 0.60 | 0.42 |
+| 定制长计划 | 5 | 0.60 | 0.37 |
+| 单伤病问答 | 25 | 0.44 | 0.38 |
+| 复合伤病问答 | 15 | 0.00 | 0.00 |
+
+> **解读（面试可讲）**：
+> ① 基础问答/动作纠错满分——参考文本锚定 CSV 动作条目，检索对单文档答案场景命中稳定；
+> ② **伤病类指标低反映真实产品结构**：禁忌/康复知识在 contra_data（确定性黑名单，非检索 KB 文档），
+> 复合伤病需要多文档证据，而 Hit@k 是"单文档 vs 单参考"的余弦比较——**指标工具与场景不匹配**，
+> 该题型的有效口径是 context_recall/precision（LLM 多文档评判）；
+> ③ 测试集参考文本由 KB 内容锚定生成（贴近原文），检索侧无泄漏（评测输入是 query，参考只定义正确性）；
+> ④ faithfulness 0.39：二元判定（任一主张无依据即 0 分）+ eval 简化 answer_chain（top-3 截断上下文），
+> 线上管线有完整 Prompt + Fact-Check 兜底，不可直接类比。
+
+> 原有 5 阶段优化流程（三路检索）历史记录见 [eval_results_final.csv](eval_results_final.csv)：
+> Hit@3 0.06→0.38（+533%）、MRR 0.05→0.30、context_precision 0.01→0.14、relevancy 0.92。
+> 核心 trade-off：放宽候选池→召回↑精度↓ → 实体过滤拉回精度。
+
+## ⚖️ 数据合规声明（面试话术）
+
+- **知识库来源（已落地）**：`TEXT_KB_SOURCES` 配置两份公开发布的官方健康科普资料，**文本直抽入库（零 OCR）**：
+  - 《科学健身18法》——国家体育总局体育科学研究所技术支持（高校官网公开转载件）
+  - 《全民健身指南》——国家体育总局 2017 年发布
+  - 原始二进制不入库（`.gitignore`），txt 抽取版随仓库可重建；**不使用网络爬虫**抓取网页内容，规避 robots 协议、版权与数据合规风险。
+- **版权资料隔离**：`*.pdf` / `*.docx` 与 `pdf_pages/` 已加入 .gitignore，原始版权文件（旧版扫描书占位资料）已移出知识库，永不入库；OCR 图片路径保留为兜底但默认停用。
+- **文本直抽 vs OCR 的取舍**（面试可讲）：公开官方资料以文本型 PDF/文档为主，pdfplumber 直抽零字符错误；OCR 仅用于无文本层的扫描件场景，且版面交错/图形标签乱码是扫描件的固有缺陷（实测 2400px 重 OCR 可修字符错误但修不了版面）。
+- **为什么不用 VL 做 PDF 文档提取**：多模态模型逐页解析速度慢、成本高、对纯文本精度不如 OCR 专项模型；VL 仅用于体检报告图片问答（/v1/vision）这类真实多模态场景——职责分离、成本可控。
+- **爬虫/版权风险认知**（可展开）：数据采集需区分「公开许可 vs 公开可见」；爬取需遵守 robots.txt、频率限制与网站条款；医疗健康内容需注明来源与时效，AI 输出不构成诊疗建议。
 
 ## 🗂️ 结构
 
 ```
-├── app.py              # Streamlit 主应用 (12步安全流水线)
-├── config.py           # 全局配置 (不入库)
-├── retriever.py        # 三路检索 + 加权融合 + 实体过滤
-├── reranker.py         # LLM listwise 重排序
-├── hyde.py             # HyDE + Step-Back + 问题分解
-├── fact_checker.py     # 四类事实校验
-├── gateway.py          # 网关 (限流/降噪/预算/内存)
-├── crag_search.py      # CRAG 联网搜索
-├── build_index.py      # 索引构建 (Milvus+BM25+Neo4j)
-├── eval_testset.py     # 百条测试集评估
-├── fitness_data.csv    # 59条动作 + 12条知识补盲
-├── test_100_full.csv   # 100条标注测试集
-└── eval_results_final.csv  # 最终评估 + 优化流程
+├── CHANGELOG.md           # 变更记录（2026-08-13 康养 Demo 改造日全记录）
+├── start.py / start.bat   # 一键启动（API+UI、健康检查、自动开浏览器、Ctrl+C 全停）
+├── kb_18fa.txt            # 《科学健身18法》文本直抽（体科所，合规公开）
+├── kb_zhinan.txt          # 《全民健身指南》文本直抽（国家体育总局，合规公开）
+├── api.py                 # FastAPI 唯一后端（SSE/鉴权/审核/vision）
+├── graph_view.py          # 伤病禁忌图谱可视化（ECharts 力导向图，双数据源）
+├── static/                # echarts.min.js（本地内置）+ graph.html（运行时生成，gitignore）
+├── .streamlit/config.toml # 开启静态服务（图谱页依赖 /app/static/）
+├── pipeline.py            # PipelineService 12 步安全流水线
+├── llm_adapter.py         # 统一大模型适配器 + 多供应商降级链
+├── guardrails.py          # Prompt 注入检测（规则加权）
+├── content_moderation.py  # 百度内容审核（fail-open）
+├── grounding.py           # 知识库依据判定（无依据拒答）
+├── text_quality.py        # OCR 乱码质检（摄入层）
+├── retriever.py           # 双路检索 + weighted/RRF 融合 + [Neo4j 可插拔]
+├── reranker.py            # LLM listwise 重排序
+├── hyde.py                # HyDE + Step-Back + 问题分解
+├── fact_checker.py        # 四类事实校验
+├── fact_cache.py          # 校验结果缓存（LRU）
+├── gateway.py             # 网关（限流/降噪/预算/内存）+ 结构化日志
+├── crag_search.py         # CRAG 博查联网搜索
+├── app.py                 # Streamlit 客户端（零索引依赖；智能问答 + 图谱 + 图文解读三视图）
+├── build_index.py         # 索引构建（OCR 质检 + Milvus + BM25 + [Neo4j]）
+├── ingest_pdf.py          # 单 PDF 摄入脚本
+├── pdf_ocr.py             # cnocr 并行 OCR + 缓存
+├── eval_testset.py        # 评测（适配器统一，--cloud/--rrf）
+├── config.py              # 全局配置（密钥走 .env）
+├── tests/                 # pytest 77 项
+└── eval_results_final.csv # 历史优化记录
 ```
