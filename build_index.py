@@ -19,12 +19,12 @@ import uuid
 import jieba
 from langchain_community.document_loaders import CSVLoader
 from langchain_core.documents import Document
-from langchain_ollama import OllamaEmbeddings
 from langchain_text_splitters import RecursiveCharacterTextSplitter
 from pymilvus import MilvusClient, DataType
 from rank_bm25 import BM25Okapi
 
 from config import *
+from llm_adapter import build_embeddings
 from retriever import save_bm25_to_pickle
 
 # 防 Windows OOM 蓝屏：限制 Ollama 并发
@@ -45,6 +45,12 @@ MAX_IMAGE_SIZE = 1200 if FAST_MODE else 1600
 for i, arg in enumerate(sys.argv):
     if arg == "--resize" and i + 1 < len(sys.argv):
         MAX_IMAGE_SIZE = int(sys.argv[i + 1])
+
+# 解析 --source-dir（PDF 页面图片目录，默认 pdf_pages）
+PDF_PAGES_DIR = "pdf_pages"
+for i, arg in enumerate(sys.argv):
+    if arg == "--source-dir" and i + 1 < len(sys.argv):
+        PDF_PAGES_DIR = sys.argv[i + 1]
 
 # embedding 批次大小（--fast 模式用小批次）
 EMBED_BATCH = 20 if FAST_MODE else 50
@@ -110,10 +116,24 @@ def build():
     raw_docs = loader.load()
     csv_count = len(raw_docs)
 
-    # 1b. PDF 图谱页面（并行 OCR + 缓存 + 降采样）
-    pdf_pages_dir = "pdf_pages"
-    if os.path.isdir(pdf_pages_dir):
-        from pdf_ocr import ocr_pages_parallel
+    # 1b. 知识库文档摄入：
+    #   优先 TEXT_KB_SOURCES 文本直抽（合规公开资料，零 OCR 错误）；
+    #   未配置时回退 pdf_pages/ 图片 OCR（占位扫描件路径）
+    if TEXT_KB_SOURCES:
+        for entry in TEXT_KB_SOURCES:
+            path = entry["file"]
+            if not os.path.isfile(path):
+                print(f"  [WARN] 文本源缺失: {path}，跳过")
+                continue
+            text = open(path, encoding="utf-8").read()
+            if text.strip():
+                raw_docs.append(Document(
+                    page_content=text,
+                    metadata={"source": entry["name"]}))
+            print(f"  文本直抽 {entry['name']}（{len(text)} 字符）")
+    elif os.path.isdir(PDF_PAGES_DIR):
+        pdf_pages_dir = PDF_PAGES_DIR
+        from pdf_ocr import ocr_pages_parallel, ocr_single_page
         page_results = ocr_pages_parallel(
             pdf_pages_dir,
             max_workers=OCR_WORKERS,
@@ -121,17 +141,35 @@ def build():
             max_image_size=MAX_IMAGE_SIZE,
         )
         if page_results:
+            # [OCR质检] 乱码过滤：不合格页提分辨率重试一次，仍不合格丢弃并打印页码
+            from text_quality import filter_ocr_pages, is_garbled
+            ok_pages, garbled_pages = filter_ocr_pages(page_results)
+            if garbled_pages:
+                print(f"  [OCR质检] 发现 {len(garbled_pages)} 页疑似乱码，"
+                      f"提分辨率重试（{OCR_QUALITY_RETRY_SIZE}px 原图）...")
+                dropped = []
+                for fname, text, page_num in garbled_pages:
+                    path = os.path.join(pdf_pages_dir, fname)
+                    text_retry = ocr_single_page(path)  # 无降采样 = 更高分辨率
+                    if text_retry.strip() and not is_garbled(text_retry):
+                        ok_pages.append((fname, text_retry, page_num))
+                    else:
+                        dropped.append(page_num)
+                if dropped:
+                    print(f"  [OCR质检] 丢弃 {len(dropped)} 页乱码：page {dropped}")
+            ok_pages.sort(key=lambda x: x[2])
+
             pdf_count = 0
-            for filename, text, page_num in page_results:
+            for filename, text, page_num in ok_pages:
                 if text.strip():
                     raw_docs.append(Document(
                         page_content=text,
-                        metadata={"source": "肌肉力量训练彩色图谱.pdf", "page": page_num}
+                        metadata={"source": PDF_SOURCE_NAME, "page": page_num}
                     ))
                     pdf_count += 1
             print(f"  PDF 摄入完成（{pdf_count} 页有文本）")
         else:
-            print(f"  pdf_pages/ 为空，跳过 PDF")
+            print(f"  {pdf_pages_dir}/ 为空，跳过 PDF")
 
         # OCR 后释放内存
         gc.collect()
@@ -189,11 +227,11 @@ def build():
     # ================================================================
     # 3. Milvus Lite 向量库构建（嵌入式，无需 Docker）
     # ================================================================
-    print(f"  正在初始化 Ollama embedding 模型 ({EMBEDDING_MODEL})...")
-    embeddings = OllamaEmbeddings(model=EMBEDDING_MODEL)
+    print(f"  正在初始化 embedding 模型（provider={EMBEDDING_PROVIDER}, model={EMBEDDING_CLOUD_MODEL if EMBEDDING_PROVIDER == 'cloud' else EMBEDDING_MODEL}）...")
+    embeddings = build_embeddings()
 
     # 使用 Milvus Lite 嵌入式模式（uri 指向本地文件）
-    client = MilvusClient(uri=MILVUS_URI)
+    client = MilvusClient(uri=MILVUS_URI, grpc_options=MILVUS_GRPC_OPTIONS)
 
     if client.has_collection(MILVUS_COLLECTION):
         try:
@@ -204,7 +242,7 @@ def build():
             client.close()
             import shutil
             shutil.rmtree(MILVUS_URI, ignore_errors=True)
-            client = MilvusClient(uri=MILVUS_URI)
+            client = MilvusClient(uri=MILVUS_URI, grpc_options=MILVUS_GRPC_OPTIONS)
 
     # 定义 schema
     schema = client.create_schema(
@@ -275,8 +313,9 @@ def build():
     # ================================================================
     # 4. Neo4j 知识图谱构建
     # ================================================================
-    if SKIP_NEO4J:
-        print("[6/7] Neo4j 跳过 (--skip-neo4j)")
+    if SKIP_NEO4J or not NEO4J_ENABLED:
+        reason = "--skip-neo4j" if SKIP_NEO4J else "NEO4J_ENABLED=False"
+        print(f"[6/7] Neo4j 跳过 ({reason})")
     else:
         _build_neo4j(raw_docs)
         print(f"[6/7] Neo4j 图谱构建完成")
@@ -302,143 +341,8 @@ def _build_neo4j(docs):
         database_=NEO4J_DATABASE,
     )
 
-    # 伤病 → 动作的禁忌/关联映射（手动定义，覆盖测试集中所有伤病类型）
-    injury_action_map = {
-        # --- 腰椎 ---
-        "腰间盘突出": [
-            ("深蹲", "禁忌动作", "负重深蹲挤压椎间盘，加重突出"),
-            ("硬拉", "禁忌动作", "硬拉需弓背发力，直接压迫腰椎"),
-            ("臀桥", "康复动作", "强化臀肌分担腰椎压力"),
-            ("平板支撑", "康复动作", "静态核心训练，腰椎零压力"),
-        ],
-        "腰突": [
-            ("深蹲", "禁忌动作", "负重深蹲挤压椎间盘，加重突出"),
-            ("硬拉", "禁忌动作", "硬拉需弓背发力，直接压迫腰椎"),
-        ],
-        "腰肌劳损": [
-            ("硬拉", "禁忌动作", "劳损期负重会加重炎症"),
-            ("猫牛式", "康复动作", "脊柱灵活性训练，缓解劳损僵硬"),
-        ],
-        "坐骨神经痛": [
-            ("深蹲", "禁忌动作", "脊柱轴向负重压迫坐骨神经"),
-            ("硬拉", "禁忌动作", "椎间孔受压加重坐骨神经症状"),
-        ],
-        # --- 膝关节 ---
-        "半月板损伤": [
-            ("深蹲", "禁忌动作", "膝盖屈伸负重挤压半月板"),
-            ("直腿抬高", "康复动作", "静态抬腿强化股四头肌，零关节压力"),
-        ],
-        "半月板撕裂": [
-            ("深蹲", "禁忌动作", "膝盖深度屈伸直接磨损撕裂半月板"),
-            ("箭步蹲", "禁忌动作", "单腿负重旋转力加重半月板撕裂"),
-        ],
-        "髌骨软化": [
-            ("深蹲", "谨慎动作", "控制下蹲深度不超过90度"),
-            ("腿伸展", "禁忌动作", "开链动作加重髌股关节压力"),
-        ],
-        "膝内扣": [
-            ("深蹲", "谨慎动作", "需弹力带辅助外展激活臀中肌"),
-            ("臀中肌激活", "康复动作", "蚌式开合/侧卧抬腿纠正膝内扣"),
-        ],
-        "膝超伸": [
-            ("腿伸展", "禁忌动作", "膝超伸加重关节后侧压力"),
-            ("腿弯举", "康复动作", "强化腘绳肌稳定膝关节后侧"),
-        ],
-        "膝关节积液": [
-            ("深蹲", "禁忌动作", "积液期高负荷加重炎症"),
-            ("直腿抬高", "康复动作", "零关节压力的股四头肌激活"),
-        ],
-        # --- 肩部 ---
-        "肩袖损伤": [
-            ("推举", "禁忌动作", "肩关节外展加重肩袖撕裂"),
-            ("侧平举", "禁忌动作", "肩外展直接牵拉损伤肩袖"),
-            ("面拉", "康复动作", "强化肩袖外旋肌群稳定性"),
-        ],
-        "肩峰撞击": [
-            ("推举", "禁忌动作", "肩外展超过90度加重撞击"),
-            ("侧平举", "禁忌动作", "掌心向下侧举直接撞击肩峰"),
-            ("面拉", "康复动作", "强化肩袖外旋肌群纠正肱骨头位置"),
-        ],
-        "肩周炎": [
-            ("推举", "禁忌动作", "肩关节僵硬时大重量推举风险高"),
-            ("钟摆运动", "康复动作", "轻幅度摆动保持关节活动度"),
-        ],
-        # --- 颈椎 ---
-        "颈椎病": [
-            ("杠铃耸肩", "禁忌动作", "耸肩压迫颈椎神经"),
-            ("收下巴训练", "康复动作", "拉伸颈后肌群缓解压迫"),
-        ],
-        # --- 肘部 ---
-        "网球肘": [
-            ("哑铃弯举", "谨慎动作", "握力负荷可能加重前臂伸肌炎症"),
-            ("锤式弯举", "康复动作", "中立握法减轻伸肌群负荷"),
-        ],
-        # --- 骨盆/脊柱 ---
-        "骨盆前倾": [
-            ("深蹲", "谨慎动作", "需先纠正体态再负重"),
-            ("臀桥", "康复动作", "强化臀肌改善骨盆前倾"),
-            ("髋屈肌拉伸", "康复动作", "松解紧张髋屈肌"),
-        ],
-        "骨盆后倾": [
-            ("硬拉", "谨慎动作", "骨盆活动度不足时不可负重硬拉"),
-            ("猫牛式", "康复动作", "改善脊柱灵活性"),
-        ],
-        "脊柱侧弯": [
-            ("杠铃深蹲", "禁忌动作", "轴向负重加重侧弯不对称"),
-            ("单侧训练", "康复动作", "针对性强化弱侧肌群纠正不平衡"),
-        ],
-        # --- 足部 ---
-        "扁平足": [
-            ("跑步", "谨慎动作", "需足弓支撑鞋垫"),
-            ("足弓训练", "康复动作", "抓毛巾/提踵强化足弓"),
-        ],
-        "足底筋膜炎": [
-            ("跑步", "禁忌动作", "足底反复冲击加重炎症"),
-            ("足底滚球", "康复动作", "用网球放松足底筋膜"),
-        ],
-        "跟腱炎": [
-            ("跑步", "禁忌动作", "跑跳加重跟腱炎症"),
-            ("站姿提踵", "谨慎动作", "离心阶段需缓慢控制"),
-        ],
-        # --- 体态 ---
-        "圆肩": [
-            ("面拉", "康复动作", "强化菱形肌和肩外旋纠正圆肩"),
-            ("卧推", "谨慎动作", "胸肌过紧可能加重圆肩"),
-        ],
-        "驼背": [
-            ("卧推", "谨慎动作", "胸大肌缩短加重驼背体态"),
-            ("划船", "康复动作", "强化上背肌群改善驼背"),
-        ],
-        "富贵包": [
-            ("收下巴训练", "康复动作", "改善颈后肌群紧张"),
-        ],
-        "高低肩": [
-            ("杠铃深蹲", "谨慎动作", "杠铃负荷不均加重肩部不对称"),
-            ("单侧哑铃推举", "康复动作", "针对性纠正弱侧力量"),
-        ],
-        "梨状肌综合征": [
-            ("深蹲", "禁忌动作", "髋关节深度屈伸加重梨状肌压迫坐骨神经"),
-            ("硬拉", "禁忌动作", "负重硬拉使梨状肌过度紧张痉挛"),
-            ("臀桥", "康复动作", "温和激活臀肌，注意幅度不宜过大"),
-            ("骨盆倾斜", "康复动作", "放松梨状肌及下背部紧张"),
-        ],
-        "骶管狭窄": [
-            ("深蹲", "禁忌动作", "脊柱轴向负重使椎管空间进一步变窄"),
-            ("硬拉", "禁忌动作", "腰椎屈伸加重骶管神经压迫"),
-            ("臀桥", "康复动作", "小幅度激活臀肌，避免腰椎过度伸展"),
-            ("单腿臀桥", "康复动作", "单侧训练减少腰椎负荷"),
-        ],
-        "坐骨神经痛": [
-            ("深蹲", "禁忌动作", "脊柱轴向负重压迫坐骨神经"),
-            ("硬拉", "禁忌动作", "椎间孔受压加重坐骨神经症状"),
-            ("臀桥", "康复动作", "温和激活臀肌，减轻神经根压迫"),
-            ("骨盆倾斜", "康复动作", "改善腰椎-骨盆位置减轻坐骨神经张力"),
-        ],
-        "骶髂关节炎": [
-            ("深蹲", "禁忌动作", "骶髂关节负重加重炎症"),
-            ("单腿臀桥", "康复动作", "单侧训练避免直接压迫骶髂关节"),
-        ],
-    }
+    # 伤病 → 动作的禁忌/关联映射（单一数据源：contra_data.py，图谱与本地降级共用）
+    from contra_data import INJURY_ACTION_MAP as injury_action_map
 
     with driver.session(database=NEO4J_DATABASE) as session:
         # 从 CSV 行抽取实体

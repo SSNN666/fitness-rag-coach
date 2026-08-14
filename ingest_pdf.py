@@ -18,12 +18,12 @@ import uuid
 
 import jieba
 from langchain_core.documents import Document
-from langchain_ollama import OllamaEmbeddings
 from langchain_text_splitters import RecursiveCharacterTextSplitter
 from pymilvus import MilvusClient, DataType
 from rank_bm25 import BM25Okapi
 
 from config import *
+from llm_adapter import build_embeddings
 from retriever import save_bm25_to_pickle
 from pdf_ocr import ocr_pages_parallel, ocr_single_page, _create_cnocr_engine
 
@@ -73,9 +73,25 @@ def build():
         page_results = ocr_pages_parallel(
             PAGES_DIR, max_workers=WORKERS, use_cache=True, force=FORCE
         )
+        # [OCR质检] 乱码过滤：不合格页提分辨率重试一次，仍不合格丢弃并打印页码
+        from text_quality import filter_ocr_pages, is_garbled
+        ok_pages, garbled_pages = filter_ocr_pages(page_results)
+        if garbled_pages:
+            print(f"  [OCR质检] 发现 {len(garbled_pages)} 页疑似乱码，提分辨率重试...")
+            dropped = []
+            for fname, text, page_num in garbled_pages:
+                path = os.path.join(PAGES_DIR, fname)
+                text_retry = ocr_single_page(path)  # 无降采样 = 更高分辨率
+                if text_retry.strip() and not is_garbled(text_retry):
+                    ok_pages.append((fname, text_retry, page_num))
+                else:
+                    dropped.append(page_num)
+            if dropped:
+                print(f"  [OCR质检] 丢弃 {len(dropped)} 页乱码：page {dropped}")
+        ok_pages.sort(key=lambda x: x[2])
         # 转换为 {filename: text} 和 page_texts 列表
-        ocr_map = {fname: text for fname, text, _ in page_results}
-        page_texts = [text for _, text, _ in page_results if text.strip()]
+        ocr_map = {fname: text for fname, text, _ in ok_pages}
+        page_texts = [text for _, text, _ in ok_pages if text.strip()]
     else:
         # EasyOCR 回退（串行）
         ocr_fn = _init_easyocr()
@@ -111,15 +127,18 @@ def build():
             page_num = int(fname.split("_")[1].split(".")[0])
             raw_docs.append(Document(
                 page_content=text,
-                metadata={"source": "肌肉力量训练彩色图谱.pdf", "page": page_num}
+                metadata={"source": PDF_SOURCE_NAME, "page": page_num}
             ))
 
     # EasyOCR 兼容
     if BACKEND != "cnocr" and not raw_docs:
+        from text_quality import is_garbled
         for i, text in enumerate(page_texts):
+            if is_garbled(text):
+                continue
             raw_docs.append(Document(
                 page_content=text,
-                metadata={"source": "肌肉力量训练彩色图谱.pdf", "page": i + 1}
+                metadata={"source": PDF_SOURCE_NAME, "page": i + 1}
             ))
 
     # ================================================================
@@ -162,8 +181,8 @@ def build():
     # ================================================================
     # 4. Milvus Lite 写入（MilvusClient API）
     # ================================================================
-    embeddings = OllamaEmbeddings(model=EMBEDDING_MODEL)
-    client = MilvusClient(uri=MILVUS_URI)
+    embeddings = build_embeddings()  # 与线上一致（cloud/ollama 按 config）
+    client = MilvusClient(uri=MILVUS_URI, grpc_options=MILVUS_GRPC_OPTIONS)
 
     # 如果 collection 存在则先删除（全量重建）
     if client.has_collection(MILVUS_COLLECTION):

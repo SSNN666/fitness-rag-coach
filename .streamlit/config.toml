@@ -1,0 +1,3 @@
+[server]
+# 知识图谱页签经 /app/static/ 加载 echarts.min.js 与 graph.html（运行时生成）
+enableStaticServing = true
