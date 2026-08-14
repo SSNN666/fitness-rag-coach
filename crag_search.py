@@ -18,14 +18,14 @@ BOCHA_SEARCH_URL = "https://api.bochaai.com/v1/web-search"
 
 
 def _get_api_key() -> str:
-    """读取 Bocha API Key。优先从 config 模块读，importlib.reload 清空时用硬编码兜底。"""
+    """读取 Bocha API Key。优先从 config 模块读，兜底读环境变量（.env）。"""
     cfg = sys.modules.get("config")
     if cfg is not None:
         key = getattr(cfg, "BOCHA_API_KEY", "")
         if key:
             return key
-    # 兜底（importlib.reload 可能短暂清空 config 属性）
-    return "sk-fd46e722a04749f6b6d758317fa535fc"
+    import os
+    return os.getenv("BOCHA_API_KEY", "")
 
 
 def build_search_query(question: str, failed_categories: list[str]) -> str:
@@ -45,7 +45,8 @@ def search_fitness(query: str, max_results: int = CRAG_MAX_RESULTS) -> list[dict
     """博查 Web Search API 搜索，返回 [{title, snippet, url}, ...]。(v4-final)"""
     try:
         import logging
-        logging.getLogger("gateway").info("crag_v4", extra={"extra_fields": {"key_ok": bool(_get_api_key()), "q": query[:30]}})
+        _log = logging.getLogger("crag_search")
+        _log.info("search_call key_ok=%s q=%s", bool(_get_api_key()), query[:30])
         resp = requests.post(
             BOCHA_SEARCH_URL,
             headers={
@@ -85,9 +86,7 @@ def search_fitness(query: str, max_results: int = CRAG_MAX_RESULTS) -> list[dict
 
     except Exception as e:
         import logging
-        logging.getLogger("gateway").warning("crag_search_error", extra={
-            "extra_fields": {"error": str(e)[:200]}
-        })
+        logging.getLogger("crag_search").warning("search_error err=%s", str(e)[:200])
         return []
 
 

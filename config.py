@@ -18,12 +18,29 @@ Ollama Server Environment Variables (set BEFORE starting Ollama, then restart):
     setx OLLAMA_MAX_LOADED_MODELS "2"
 """
 
+import os
+
+from dotenv import load_dotenv
+
+load_dotenv()  # 从 .env 加载密钥（NEO4J_PASSWORD / BOCHA_API_KEY），密钥不入库
+
 LLM_MODEL = "qwen2.5:7b"            # 主流式生成 + CRAG 兜底
-EMBEDDING_MODEL = "nomic-embed-text" # 向量嵌入（不变）
+EMBEDDING_MODEL = "nomic-embed-text" # 向量嵌入（本地 Ollama，不变）
+# 云端 Embedding（消除并发时的本地 embedding 排队；切换供应商必须重建索引）
+EMBEDDING_PROVIDER = os.getenv("EMBEDDING_PROVIDER", "cloud")   # "cloud" | "ollama"
+EMBEDDING_CLOUD_MODEL = "qwen3.7-text-embedding"  # MaaS 实测：原生 1024 维，指定 768 与现有 schema 一致
+EMBEDDING_CLOUD_DIM = 768                         # 必须等于 MILVUS_DIM
 HYDE_MODEL = "qwen2.5:0.5b"          # HyDE 假想文档生成（0.5B instruct，极速草稿）
 RERANK_MODEL = LLM_MODEL              # Reranker 与主生成共用 qwen2.5:7b（串行复用）
 CSV_FILE = "fitness_data.csv"
-RETRIEVE_TOP_K = 3
+PDF_SOURCE_NAME = os.getenv("PDF_SOURCE_NAME", "康养公开资料.pdf")  # 仅图片 OCR 路径（占位扫描件）的来源显示名
+# 知识库文本直抽源（合规公开资料，零 OCR）：(文件, 引用来源显示名)
+# 配置后 build_index 优先走文本路径，跳过 pdf_pages/ 图片 OCR（占位版权扫描件路径自动停用）
+TEXT_KB_SOURCES = [
+    {"file": "kb_18fa.txt",   "name": "科学健身18法（国家体育总局体科所）"},
+    {"file": "kb_zhinan.txt", "name": "全民健身指南（国家体育总局）"},
+]
+RETRIEVE_TOP_K = 5
 
 # ============================================================
 # Milvus Lite 向量数据库（嵌入式模式，无需 Docker）
@@ -32,12 +49,18 @@ MILVUS_URI = "./milvus.db"
 MILVUS_COLLECTION = "fitness_rag"
 MILVUS_DIM = 768                     # nomic-embed-text 输出维度
 
+# gRPC keepalive 覆盖：pymilvus 3.x 默认 grpc.keepalive_time_ms=10000（每 10s ping），
+# Milvus Lite 内嵌服务端 ping 限频更严 → 每约 2 分钟一次 GOAWAY "too_many_pings" 断连重连
+# （日志 E0814 chttp2_transport 噪音，连接自动恢复）。本地嵌入式连接无需 keepalive 探活，
+# INT_MAX 为 gRPC 禁用语义；如换远端 Milvus 服务可按需改回较小值。
+MILVUS_GRPC_OPTIONS = {"grpc.keepalive_time_ms": 2147483647}
+
 # ============================================================
 # Neo4j AuraDB 知识图谱（云端免费实例）
 # ============================================================
 NEO4J_URI = "neo4j+s://04e61057.databases.neo4j.io"
 NEO4J_USER = "04e61057"
-NEO4J_PASSWORD = "bX_pIf4q6cpTV-JyeuIs2S1R8Y03LCojIunrDYnkS7Y"
+NEO4J_PASSWORD = os.getenv("NEO4J_PASSWORD", "")  # 密钥位于 .env，勿硬编码
 NEO4J_DATABASE = "04e61057"
 
 # ============================================================
@@ -51,7 +74,11 @@ BM25_INDEX_PATH = "./bm25_index.pkl"
 FUSION_WEIGHT_MILVUS = 0.40          # Milvus 语义向量权重（原 0.50，给图谱让空间）
 FUSION_WEIGHT_BM25 = 0.30            # BM25 关键词权重（不变）
 FUSION_WEIGHT_NEO4J = 0.30           # Neo4j 图谱关联权重（原 0.20，提升以发挥多跳推理价值）
-FUSION_THRESHOLD = 0.15              # 全局最低分数阈值，低于此值丢弃
+FUSION_THRESHOLD = 0.20              # 全局最低分数阈值，低于此值丢弃
+CONTEXT_DOCS_MAX = 3                  # 送入 LLM 的最终文档数上限
+FUSION_SEMANTIC_DEDUP_ENABLED = False  # 语义去重：余弦相似度 > 阈值时仅保留得分高者
+FUSION_SEMANTIC_DEDUP_THRESHOLD = 0.85  # 语义去重余弦相似度阈值
+FUSION_MIN_DOCS = 3                  # 语义去重后至少保留的文档数
 
 # ============================================================
 # Neo4j 多跳推理配置
@@ -63,7 +90,7 @@ NEO4J_PATH_BOOST_CONTRAIND = 1.5     # 经过禁忌关系的路径 boost 倍数
 # ============================================================
 # 网关路由权重：根据查询类型动态切换 (Milvus, BM25, Neo4j)
 # ============================================================
-ROUTE_WEIGHTS_DEFAULT = (0.45, 0.35, 0.20)   # 普通问答：向量为主
+ROUTE_WEIGHTS_DEFAULT = (0.40, 0.35, 0.25)   # 普通问答：图谱微提权
 ROUTE_WEIGHTS_SINGLE  = (0.30, 0.25, 0.45)   # 单伤病：图谱提权
 ROUTE_WEIGHTS_COMPOUND = (0.20, 0.25, 0.55)  # 复合伤病：图谱主导
 
@@ -80,7 +107,7 @@ CRAG_ENABLED = True
 CRAG_SEARCH_ENGINE = "bocha"           # 博查 AI 搜索（国内可用，个人免费套餐）
 CRAG_MAX_RESULTS = 5                   # 每次搜索返回条数
 CRAG_TIMEOUT = 5                       # 联网超时秒数
-BOCHA_API_KEY = "sk-fd46e722a04749f6b6d758317fa535fc"
+BOCHA_API_KEY = os.getenv("BOCHA_API_KEY", "")  # 密钥位于 .env，勿硬编码
 
 # CRAG 外部知识触发词：含这些关键词的伤病查询自动联网（本地知识库覆盖不足）
 CRAG_EXTERNAL_KEYWORDS = [
@@ -97,6 +124,9 @@ CRAG_EXTERNAL_KEYWORDS = [
 FACT_CACHE_ENABLED = True
 FACT_CACHE_MAX = 200                   # 最多缓存条数
 FACT_CACHE_PATH = "fact_cache.json"
+# 提示词版本（缓存 key 的一部分）：改动分层 Prompt / 层级 hint 后 bump 此值，
+# 旧缓存自动失效（实测教训：改 600 字约束后重启，旧长回答仍从缓存吐出，新提示词不生效）
+FACT_CACHE_VERSION = 2
 
 # ============================================================
 # Ollama Engine Configuration (passed per-request to Ollama API)
@@ -112,12 +142,13 @@ CHAT_TOKEN_ESTIMATE_RATIO = 1.8        # Chinese token estimate multiplier (adju
 MAX_QUERY_CHARS = 1200                 # User query hard limit (~600-800 tokens for Chinese)
 CONTEXT_BUDGET_RATIO = 0.55            # Retrieved context ceiling as fraction of num_ctx
 ANSWER_BUDGET_MIN = 500                # Minimum tokens reserved for LLM generation output
+SESSION_MAX_COUNT = 64                 # 会话 store 上限（超出按最久未访问驱逐，防止内存只增不减）
 
 # ============================================================
 # 切片配置（token 级，基于 tiktoken cl100k_base 编码）
 # ============================================================
-CHUNK_CHILD_TOKENS = 200
-CHUNK_PARENT_TOKENS = 500
+CHUNK_CHILD_TOKENS = 300
+CHUNK_PARENT_TOKENS = 600
 CHUNK_OVERLAP_RATIO = 0.15
 
 # ============================================================
@@ -168,7 +199,7 @@ RERANK_MILVUS_FACTOR = 5       # 原 3，扩大候选池给 reranker 选择
 RERANK_BM25_FACTOR = 5         # 原 3
 RERANK_NEO4J_FACTOR = 3        # 原 2
 RERANKER_MAX_CANDIDATES = 15   # 送入 LLM 排名的最大候选数
-RERANKER_DOC_MAX_CHARS = 200   # 每个候选文档截断字符数
+RERANKER_DOC_MAX_CHARS = 400   # 每个候选文档截断字符数
 
 # ============================================================
 # 内存自适应 keep_alive（Windows GlobalMemoryStatusEx，零外部依赖）
@@ -238,3 +269,117 @@ MEMORY_GUARD_ENABLED = True
 MEMORY_GUARD_THRESHOLD = 3.0              # 可用内存低于此值 (GB) 触发降级
 MEMORY_GUARD_RECOVERY = 4.0               # 可用内存高于此值 (GB) 恢复 (迟滞防抖)
 MEMORY_GUARD_DEGRADED_MODEL = "qwen2.5:1.5b"
+
+# ============================================================
+# ★ 统一大模型适配器（康养 Demo 改造）
+#   主链路云端（阿里云百炼 DashScope），千帆可选，Ollama 仅本地调试/兜底
+# ============================================================
+LLM_PROVIDER_PRIMARY = "dashscope"      # 主链路供应商："dashscope" | "ollama"（全本地调试）
+LLM_FALLBACK_CHAIN = ["dashscope", "qianfan", "ollama"]  # 降级链顺序；未配 Key 的供应商自动跳过
+LLM_LOCAL_FALLBACK_ENABLED = True       # 云端全部失败时是否落本地 Ollama
+
+DASHSCOPE_API_KEY = os.getenv("DASHSCOPE_API_KEY", "")   # 密钥位于 .env，勿硬编码
+DASHSCOPE_BASE_URL = os.getenv(                         # 私有 MaaS 部署用自定义 Host，公共云用 dashscope.aliyuncs.com
+    "DASHSCOPE_BASE_URL",
+    "https://dashscope.aliyuncs.com/compatible-mode/v1",
+)  # OpenAI 兼容模式
+QIANFAN_API_KEY = os.getenv("QIANFAN_API_KEY", "")       # 可选第二云供应商（千帆 ERNIE）
+QIANFAN_BASE_URL = "https://qianfan.baidubce.com/v2"
+OLLAMA_BASE_URL = "http://localhost:11434"
+
+LLM_TIMEOUT = 60.0                      # 云端单次请求超时秒数
+LLM_LOCAL_TIMEOUT = 300.0               # 本地 Ollama 超时（CPU 推理慢）
+LLM_MAX_RETRIES = 2                     # 单供应商内可重试次数（额度不足/鉴权/上下文超长不盲目重试）
+LLM_RETRY_BACKOFF = (1.0, 2.0)          # 重试退避秒数
+
+# 角色 → 各供应商模型映射 + 生成参数（vision 本地无 VL 模型 → 云失败时返回明确提示）
+# 注：私有 MaaS 部署无 qwen-plus 公共型号，按 models.list() 实际可用名映射
+# thinking: 混合思考开关（仅 DashScope 生效）。qwen3.7 默认思考模式极慢（实测 8.4s vs 0.5s），
+#           短回答类任务（快速问答/重排/校验/判分）全部关闭；复杂伤病问答保留思考保质量
+LLM_ROLES = {
+    "chat":         {"dashscope": "qwen3.7-plus", "qianfan": "ernie-4.5-turbo-128k", "ollama": "qwen2.5:7b", "temperature": 0.7, "max_tokens": None, "thinking": True, "thinking_budget": 2048},
+    "chat_nothink": {"dashscope": "qwen3.7-plus", "qianfan": "ernie-4.5-turbo-128k", "ollama": "qwen2.5:7b", "temperature": 0.7, "max_tokens": None, "thinking": False},
+    "chat_fast":    {"dashscope": "qwen3.7-flash", "qianfan": "ernie-speed-128k", "ollama": "qwen2.5:7b", "temperature": 0.7, "max_tokens": 400, "thinking": False},
+    "hyde":         {"dashscope": "qwen3.7-flash", "qianfan": "ernie-speed-128k", "ollama": "qwen2.5:0.5b", "temperature": 0.7, "max_tokens": 256, "thinking": False},
+    "fact_check":   {"dashscope": "qwen3.7-flash", "qianfan": "ernie-speed-128k", "ollama": "qwen2.5:1.5b", "temperature": 0.0, "max_tokens": 128, "thinking": False},
+    "rerank":       {"dashscope": "qwen3.7-flash", "qianfan": "ernie-speed-128k", "ollama": "qwen2.5:7b", "temperature": 0.0, "max_tokens": 32, "thinking": False},
+    "judge":        {"dashscope": "qwen3.7-flash", "qianfan": "ernie-speed-128k", "ollama": "qwen2.5:7b", "temperature": 0.0, "max_tokens": 8, "thinking": False},
+    "vision":       {"dashscope": "qwen3-vl-plus-2025-12-19", "qianfan": "ernie-4.5-turbo-128k", "ollama": None, "temperature": 0.3, "max_tokens": 1024},
+}
+
+# ============================================================
+# 分层生成策略：简单问题快速生成，生成时间随复杂度递增
+#   默认全部关思考（快）；用户开启「深度思考」后 injury/plan 层切 chat（思考开）
+#   simple: 快模型 + 短预算（400 token）+ 跳过 LLM 重排
+#   injury: 主模型关思考 + 中预算 + 重排 + Fact-Check（答后提示可开深度思考）
+#   plan:   主模型关思考 + 长预算 + 重排（答后提示可开深度思考）
+# ============================================================
+LLM_TIERS = {
+    # retrieve_k: HyDE 检索 top-k；context_docs: 送入 LLM 的文档数（plan 层加宽——计划需要多文档依据）
+    "simple": {"role": "chat_fast", "max_tokens": 400,  "rerank": False,
+               "retrieve_k": 3, "context_docs": 3,
+               "hint": "请简明扼要回答，控制在200字以内，直接给结论，不要展开。"},
+    "injury": {"role": "chat_nothink", "max_tokens": 1024, "rerank": True,
+               "retrieve_k": 3, "context_docs": 3,
+               "hint": "请聚焦用户的具体问题作答，控制在600字以内，条理清晰，直接给建议与依据。"
+                      "（深度思考模式下无此限制）"},
+    "plan":   {"role": "chat_nothink", "max_tokens": 2048, "rerank": True,
+               "retrieve_k": 6, "context_docs": 6, "hint": ""},
+}
+
+# ============================================================
+# 检索融合模式：weighted（原加权融合）| rrf（Reciprocal Rank Fusion）
+# ============================================================
+FUSION_MODE = "weighted"                # 默认保留原加权融合，可切 "rrf"（eval 对比后定）
+RRF_K = 60                              # RRF 常数 score(d)=Σ 1/(k+rank(d))
+
+# ============================================================
+# Neo4j 知识图谱开关（康养 Demo 默认停用，不依赖外部 AuraDB）
+# 代码全保留：切 True 即恢复三路检索（需先轮换泄露的 AuraDB 密码）
+# ============================================================
+NEO4J_ENABLED = False
+
+# ============================================================
+# FastAPI 服务（康养 Demo 唯一后端；Streamlit 改为 SSE 客户端）
+# ============================================================
+API_HOST = "127.0.0.1"
+API_PORT = 8000
+API_KEY_AUTH = os.getenv("API_KEY_AUTH", "")   # 演示级鉴权：非空则要求 X-API-Key 头；空=本地免鉴权
+SSE_BUFFER_FIRST = True                # SSE 缓冲模式：先完整生成→输出审核→再分块吐出（审核先于展示）
+SSE_CHUNK_CHARS = 24                   # 缓冲模式下每块字符数（视觉流式）
+
+# ============================================================
+# 防护：Prompt 注入检测 + 百度内容审核
+# ============================================================
+PROMPT_INJECTION_ENABLED = True
+PROMPT_INJECTION_BLOCK_SCORE = 4       # 加权分 ≥ 此值拦截（3 分仅记日志放行）
+BAIDU_CENSOR_ENABLED = True
+BAIDU_AK = os.getenv("BAIDU_AK", "")   # 内容审核 AK/SK（百度智能云，非千帆 Key）
+BAIDU_SK = os.getenv("BAIDU_SK", "")
+CENSOR_TIMEOUT = 3.0                   # 审核超时秒数（超时 fail-open 放行 + ERROR 日志）
+
+# ============================================================
+# 拒答（grounding）：知识库无依据时拒绝回答（生成前判定）
+# ============================================================
+REFUSE_ENABLED = True
+GROUNDING_MIN_CTX_CHARS = 80           # 上下文低于此字数且无外部资料 → 拒答
+GROUNDING_MIN_SCORE = None             # weighted 模式最低融合分（None=沿用 FUSION_THRESHOLD）
+GROUNDING_MIN_SIM = 0.40               # 无实体查询的语义相关性硬门槛：query 与 top 文档最大余弦低于此值 → 拒答
+                                       # qwen3.7-text-embedding 实测校准：无关类 max≈0.29-0.38，无实体健身类 0.35-0.67，
+                                       # 阈值取 0.40（宁拒少答，拒答时引导换问法；漏放由 PROMPT_GENERAL 引导兜底）
+                                       # 注：切换 Embedding 供应商需重建索引并重新校准此值
+
+# ============================================================
+# OCR 乱码质检（摄入层，不进 pdf_ocr 避免污染缓存）
+# ============================================================
+OCR_QUALITY_ENABLED = True
+OCR_QUALITY_MIN_CHARS = 10             # 低于此字数视为空页丢弃
+OCR_QUALITY_CHAR_RATIO = 0.6           # 合法字符占比阈值
+OCR_QUALITY_DICT_COVERAGE = 0.35       # jieba 词典命中率阈值（康养术语 OOV 多，放宽）
+OCR_QUALITY_REPETITION = 0.3           # 最高频单字符占比阈值（>此值判乱码）
+OCR_QUALITY_RETRY_SIZE = 2400          # 乱码页提分辨率重试的降采样边长
+
+# ============================================================
+# 评测供应商（默认本地 Ollama 防烧钱；--cloud 切云端）
+# ============================================================
+EVAL_PROVIDER = "ollama"

@@ -42,12 +42,12 @@ class FactCache:
             return self._data.get(key)
 
     def set(self, question: str, answer: str, entities: list[str] | None = None):
-        """存入校验通过的回答；超过最大条数自动淘汰旧条目。"""
+        """存入校验通过的回答；超过最大条数按插入序淘汰最旧 20%（FIFO）。"""
         key = self._make_key(question, entities)
         with self._lock:
             self._data[key] = answer
             if len(self._data) > self._max:
-                # LRU 淘汰：删除最旧的 20%
+                # FIFO 淘汰：删除最旧的 20%（高频伤病问答场景访问分布均匀，FIFO 足够）
                 evict_count = max(1, self._max // 5)
                 old_keys = list(self._data.keys())[:evict_count]
                 for k in old_keys:

@@ -121,7 +121,7 @@ def generate_hypothetical_doc(question: str, llm, classification: str) -> str:
 
     Args:
         question: 用户原始查询
-        llm: ChatOllama 实例
+        llm: 统一适配器 FallbackChain 实例
         classification: classify_query 返回的分类标签
 
     Returns:
@@ -157,7 +157,7 @@ def generate_step_back(question: str, llm) -> str:
 
     Args:
         question: 用户原始查询
-        llm: ChatOllama 实例
+        llm: 统一适配器 FallbackChain 实例
 
     Returns:
         抽象问句字符串；异常时回退为原始 query
@@ -184,7 +184,7 @@ def decompose_question(question: str, llm) -> list:
 
     Args:
         question: 用户原始查询
-        llm: ChatOllama 实例
+        llm: 统一适配器 FallbackChain 实例
 
     Returns:
         子问题字符串列表；异常时回退为 [question]
@@ -248,7 +248,40 @@ def _merge_deduplicate(doc_lists: list, max_total: int) -> list:
     return merged[:max_total]
 
 
-def multi_query_retrieve(question: str, llm, retriever) -> list:
+def generate_hyde_drafts(question: str, llm, label: str | None = None) -> list[str]:
+    """
+    锁外生成全部检索草稿（云端 LLM，无共享状态）：
+      - simple / single_injury: 单条 HyDE 假想文档
+      - compound_injury: 三路并行（HyDE + Step Back + 子问题拆分）
+
+    检索仍在调用方锁内执行（Milvus Lite 非线程安全）——本函数从检索管道中拆出，
+    供 pipeline 两阶段线程模型使用（草稿生成锁外并行，检索锁内串行）。
+
+    Returns:
+        草稿查询列表（生成失败回退为原始 question，列表恒非空）
+    """
+    label = label or classify_query(question)
+    if label != "compound_injury":
+        return [generate_hypothetical_doc(question, llm, label)]
+
+    # 三路草稿 LLM 生成并行（云调用无共享状态）
+    from concurrent.futures import ThreadPoolExecutor
+    with ThreadPoolExecutor(max_workers=3) as ex:
+        f_hyde = ex.submit(generate_hypothetical_doc, question, llm, "compound_injury")
+        f_sb = ex.submit(generate_step_back, question, llm) if STEP_BACK_ENABLED else None
+        f_sq = ex.submit(decompose_question, question, llm) if DECOMPOSE_ENABLED else None
+        hyde_doc = f_hyde.result()
+        step_back_q = f_sb.result() if f_sb else None
+        sub_questions = f_sq.result() if f_sq else []
+
+    drafts = [hyde_doc]
+    if step_back_q:
+        drafts.append(step_back_q)
+    drafts.extend(sub_questions)
+    return drafts
+
+
+def multi_query_retrieve(question: str, llm, retriever, drafts: list[str] | None = None) -> list:
     """
     三路并行召回（仅对 compound_injury 触发），返回 Document 对象列表：
       路1: HyDE 假想文档检索
@@ -257,37 +290,21 @@ def multi_query_retrieve(question: str, llm, retriever) -> list:
 
     Args:
         question: 用户原始查询
-        llm: ChatOllama 实例
+        llm: 统一适配器 FallbackChain 实例
         retriever: FitnessRAGRetriever 实例
+        drafts: 锁外已生成的草稿（pipeline 两阶段用法）；None 时内部生成（旧调用方兼容）
 
     Returns:
         合并去重后的 LangChain Document 列表
     """
-    all_doc_lists = []
+    drafts = drafts if drafts else generate_hyde_drafts(question, llm)
 
-    # 路1: HyDE 假想文档检索
-    hyde_doc = generate_hypothetical_doc(question, llm, "compound_injury")
-    docs_hyde = _retrieve_docs(hyde_doc, retriever, MULTI_QUERY_TOP_K)
-    all_doc_lists.append(docs_hyde)
-
-    # 路2: Step Back 抽象问句检索
-    if STEP_BACK_ENABLED:
-        step_back_q = generate_step_back(question, llm)
-        docs_step_back = _retrieve_docs(step_back_q, retriever, MULTI_QUERY_TOP_K)
-        all_doc_lists.append(docs_step_back)
-
-    # 路3: 拆解子问题检索
-    if DECOMPOSE_ENABLED:
-        sub_questions = decompose_question(question, llm)
-        for sub_q in sub_questions:
-            docs_sub = _retrieve_docs(sub_q, retriever, MULTI_QUERY_TOP_K)
-            all_doc_lists.append(docs_sub)
-
-    # 合并去重
+    all_doc_lists = [_retrieve_docs(d, retriever, MULTI_QUERY_TOP_K) for d in drafts]
     return _merge_deduplicate(all_doc_lists, MAX_TOTAL_DOCS)
 
 
-def hyde_retrieve(question: str, llm, retriever) -> str:
+def hyde_retrieve(question: str, llm, retriever, top_k: int | None = None,
+                  drafts: list[str] | None = None) -> tuple[str, list]:
     """
     HyDE 检索管道：分类 → 选择检索策略 → 格式化。
 
@@ -296,21 +313,25 @@ def hyde_retrieve(question: str, llm, retriever) -> str:
 
     Args:
         question: 用户原始查询
-        llm: ChatOllama 实例
+        llm: 统一适配器 FallbackChain 实例（建议 HYDE_MODEL 小模型，不占用主生成算力）
         retriever: FitnessRAGRetriever 实例
+        top_k: 单路 HyDE 检索 top-k（None=config.HYDE_TOP_K；plan 层传更大值加宽上下文）
+        drafts: 锁外已生成的草稿（pipeline 两阶段用法：草稿生成锁外，检索锁内）
 
     Returns:
-        格式化后的检索文档字符串（与现有 format_docs 输出兼容）
+        (格式化后的检索上下文字符串, 原始 Document 列表) — docs 供引用来源展示，
+        调用方无需为引用再执行一次检索。
     """
     # 1. 分类
     label = classify_query(question)
 
     # 2. 复合伤病 → 三路召回；其他 → 单路 HyDE
     if label == "compound_injury":
-        docs = multi_query_retrieve(question, llm, retriever)
-        return "\n\n".join(doc.page_content for doc in docs)
+        docs = multi_query_retrieve(question, llm, retriever, drafts=drafts)
+        return "\n\n".join(doc.page_content for doc in docs), docs
 
     # 3. 简单/单伤病：单路 HyDE 检索 → 返回父块
-    hyde_doc = generate_hypothetical_doc(question, llm, label)
-    docs = retriever.similarity_search(hyde_doc, k=HYDE_TOP_K)
-    return "\n\n".join(doc.page_content for doc in docs)
+    hyde_doc = drafts[0] if drafts else generate_hypothetical_doc(question, llm, label)
+    k = top_k or HYDE_TOP_K
+    docs = retriever.similarity_search(hyde_doc, k=k)
+    return "\n\n".join(doc.page_content for doc in docs), docs

@@ -26,8 +26,17 @@ pdf_ocr_cache.json
 gateway.log
 *.log
 
-# 配置文件（如果有敏感信息）
-config.py
+# 知识图谱页运行时生成（echarts.min.js 为静态依赖需入库，graph.html 每次重跑覆盖）
+static/graph.html
+
+# PDF 原始文件与页面图片（版权资料，永不入库）
+*.pdf
+pdf_pages/
+
+# 合规资料源文件（二进制不入库；txt 抽取版在 TEXT_KB_SOURCES 中入库）
+kb_*.docx
+
+# 密钥文件（真实密钥在 .env，勿提交；.env.example 可入库）
 .env
 
 # IDE配置

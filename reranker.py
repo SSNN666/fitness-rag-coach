@@ -20,7 +20,7 @@ class FitnessReranker:
     def __init__(self, llm, max_candidates: int = 15, doc_max_chars: int = 200):
         """
         Args:
-            llm: ChatOllama 实例（已加载的 qwen2.5:7b，temperature=0 确保确定性排序）
+            llm: 统一适配器 FallbackChain 实例（build_llm("rerank")，temperature=0 确保确定性排序）
             max_candidates: 送入 LLM 的最大候选数
             doc_max_chars: 每个文档截断字符数（~130 中文字足够判断相关性）
         """

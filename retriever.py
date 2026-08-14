@@ -54,18 +54,21 @@ class FitnessRAGRetriever:
         neo4j_factor: int = 2,
         neo4j_depth: int = 1,
         neo4j_max_depth: int = 3,
+        fusion_mode: str | None = None,
     ):
         """
         Args:
             milvus_client: pymilvus.MilvusClient（Milvus Lite 嵌入式连接）
             bm25_index: rank_bm25.BM25Okapi 实例 + docstore 元组
-            neo4j_driver: neo4j.Driver（bolt 连接）
+            neo4j_driver: neo4j.Driver（bolt 连接）；None = 图谱停用（NEO4J_ENABLED=False）
             embedding_fn: callable，输入 text 返回 768 维向量
-            w_milvus / w_bm25 / w_neo4j: 三路权重，建议和为 1.0
-            fusion_threshold: 全局最低分数阈值
+            w_milvus / w_bm25 / w_neo4j: 三路权重，建议和为 1.0（仅 weighted 模式）
+            fusion_threshold: 全局最低分数阈值（仅 weighted 模式）
             reranker: FitnessReranker 实例（可选），用于 LLM listwise 重排序
             milvus_factor / bm25_factor / neo4j_factor: 各路检索扩大倍数
             neo4j_depth / neo4j_max_depth: 单伤病 1-hop / 复合伤病最大 hop 数
+            fusion_mode: "weighted"（加权融合）| "rrf"（Reciprocal Rank Fusion）；
+                         默认读 config.FUSION_MODE
         """
         self._milvus = milvus_client
         self._bm25_idx, self._bm25_docs = bm25_index  # 解包 (BM25Okapi, doc_list)
@@ -81,6 +84,10 @@ class FitnessRAGRetriever:
         self.neo4j_factor = neo4j_factor
         self.neo4j_depth = neo4j_depth
         self.neo4j_max_depth = neo4j_max_depth
+        if fusion_mode is None:
+            import config as _cfg
+            fusion_mode = getattr(_cfg, "FUSION_MODE", "weighted")
+        self._fusion_mode = fusion_mode
 
     # ================================================================
     # 对外接口
@@ -95,6 +102,12 @@ class FitnessRAGRetriever:
         """LangChain BaseRetriever 兼容接口。"""
         return self.similarity_search(query)
 
+    def rerank(self, query: str, candidates: list[tuple[Document, float]], top_k: int):
+        """LLM 重排（pipeline 锁外调用——云端 LLM 无共享状态；融合检索仍在锁内）。"""
+        if self._reranker is None or len(candidates) <= top_k:
+            return candidates[:top_k]
+        return self._reranker.rerank(query, candidates, top_k=top_k)
+
     def get_contraindications(self, injury_names: list[str]) -> dict[str, list[str]]:
         """
         查询 Neo4j 获取指定伤病 → 禁忌动作/器械映射。
@@ -103,6 +116,8 @@ class FitnessRAGRetriever:
             {"腰突": ["深蹲","硬拉","罗马尼亚硬拉",...], ...}
         """
         if not injury_names:
+            return {}
+        if self._neo4j is None:  # 图谱停用（NEO4J_ENABLED=False）
             return {}
 
         cypher = """
@@ -121,9 +136,14 @@ class FitnessRAGRetriever:
 
         return {rec["injury"]: rec["forbidden"] for rec in records}
 
-    def search_with_scores(self, query: str, k: int = 3) -> list[tuple[Document, float]]:
+    def search_with_scores(self, query: str, k: int = 3,
+                           use_rerank: bool | None = None) -> list[tuple[Document, float]]:
         """
         三路独立检索 + 动态权重融合（网关路由） + 去噪去重 + (可选) LLM 重排序。
+
+        Args:
+            use_rerank: None=按是否配置 reranker 自动；False=本查询跳过 LLM 重排
+                        （分层生成策略：simple 查询跳过重排省时）
 
         Returns:
             [(Document, final_score), ...] 按得分降序
@@ -133,21 +153,26 @@ class FitnessRAGRetriever:
         bm25_results = self._search_bm25(query, k * self.bm25_factor)
         neo4j_results = self._search_neo4j(query, k * self.neo4j_factor)
 
-        # 网关路由：根据查询类型动态调整权重
-        w_m, w_b, w_n = self._route_weights(query)
+        path_results = [milvus_results, bm25_results, neo4j_results]
 
-        # 加权融合：不截断，返回所有通过阈值的候选
-        merged = self._weighted_fusion(
-            [milvus_results, bm25_results, neo4j_results],
-            [w_m, w_b, w_n],
-            top_k=None,  # 不截断，交给 reranker
-        )
+        # 融合模式分支：rrf（分数=Σ1/(k+rank)，无数值阈值语义）| weighted（动态权重+阈值去噪）
+        if self._fusion_mode == "rrf":
+            merged = self._rrf_fusion(path_results, top_k=None)
+        else:
+            # 网关路由：根据查询类型动态调整权重（仅 weighted 模式有意义）
+            w_m, w_b, w_n = self._route_weights(query)
+            merged = self._weighted_fusion(
+                path_results, [w_m, w_b, w_n],
+                top_k=None,  # 不截断，交给 reranker
+            )
 
         # 实体匹配 boost：匹配 query 实体的文档提权，不匹配的降权
         merged = self._entity_match_boost(query, merged)
 
-        # LLM 重排序（如果启用）
-        if self._reranker is not None and len(merged) > k:
+        # LLM 重排序（分层生成策略可跳过；默认按配置）
+        if use_rerank is None:
+            use_rerank = self._reranker is not None
+        if use_rerank and self._reranker is not None and len(merged) > k:
             merged = self._reranker.rerank(query, merged, top_k=k)
 
         return merged[:k]
@@ -351,6 +376,8 @@ class FitnessRAGRetriever:
         Returns:
             [(Document(context_text), score), ...]  score 按路径深度和关系类型差异化
         """
+        if self._neo4j is None:  # 图谱停用（NEO4J_ENABLED=False）→ 空结果，融合不受影响
+            return []
         entities = self._extract_entities(query)
         if not entities:
             return []
@@ -631,6 +658,39 @@ class FitnessRAGRetriever:
 
         merged.sort(key=lambda x: x[1], reverse=True)
 
+        if top_k is None:
+            return merged
+        return merged[:top_k]
+
+    def _rrf_fusion(
+        self,
+        path_results: list[list[tuple[Document, float]]],
+        top_k: int | None = None,
+    ) -> list[tuple[Document, float]]:
+        """
+        Reciprocal Rank Fusion：score(d) = Σ_r 1/(k + rank_r(d))。
+
+        各路先按自身得分降序排位，再对每篇文档跨路累加 RRF 分。
+          - 天然跨路去重（同一文档多路命中 → 分数累加）
+          - 分数是 [0, ~n/k] 的小数值，无明确"最低阈值"语义 → 不应用 self.threshold
+          - 动态路由权重（_route_weights）仅对 weighted 模式有意义，本模式忽略
+        """
+        from config import RRF_K
+        k = RRF_K
+        doc_map: dict[str, tuple[Document, float]] = {}
+        for results in path_results:
+            ranked = sorted(results, key=lambda x: x[1], reverse=True)
+            for rank, (doc, _score) in enumerate(ranked):
+                key = _md5(doc.page_content)
+                rrf_score = 1.0 / (k + rank + 1)
+                if key in doc_map:
+                    prev_doc, prev_score = doc_map[key]
+                    doc_map[key] = (prev_doc, prev_score + rrf_score)
+                else:
+                    doc_map[key] = (doc, rrf_score)
+
+        merged = list(doc_map.values())
+        merged.sort(key=lambda x: x[1], reverse=True)
         if top_k is None:
             return merged
         return merged[:top_k]

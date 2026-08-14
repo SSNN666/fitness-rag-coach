@@ -1,7 +1,7 @@
 """
 FactCheckEngine —— 四类事实校验引擎
 ====================================
-用小模型（deepseek-r1:1.5b）逐项检查 AI 回答的：
+用小模型（qwen2.5:1.5b / 云端 qwen-plus）逐项检查 AI 回答的：
   1. 动作建议  2. 康复周期  3. 负重限制  4. 伤病禁忌
 任一 FAIL → 触发 CRAG 联网修正；全部 PASS → 缓存回答。
 
@@ -65,7 +65,7 @@ class FactCheckEngine:
     def __init__(self, llm):
         """
         Args:
-            llm: ChatOllama 实例（小模型，如 deepseek-r1:1.5b, temperature=0）
+            llm: 统一适配器（to_runnable(build_llm("fact_check"))，小模型，temperature=0）
         """
         self._llm = llm
         self._chain = _FACT_CHECK_PROMPT | llm | StrOutputParser()

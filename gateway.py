@@ -155,6 +155,29 @@ class _StructuredLogger:
     def error(self, event: str, **kwargs):
         self.log("error", event, **kwargs)
 
+    # ---------- 康养 Demo 扩展：完整日志（query/检索片段/prompt/输出/token 消耗） ----------
+
+    def log_usage(self, request_id: str, role: str, usage) -> None:
+        """LLM 调用 token 消耗（llm_adapter 的 on_usage 回调目标）。usage 为 UsageInfo。"""
+        self.info("llm_usage", request_id=request_id, role=role,
+                  provider=usage.provider, model=usage.model,
+                  prompt_tokens=usage.prompt_tokens,
+                  completion_tokens=usage.completion_tokens,
+                  total_tokens=usage.total_tokens,
+                  latency_ms=usage.latency_ms)
+
+    def log_retrieval(self, request_id: str, query: str, docs: list) -> None:
+        """检索片段：原始 query + 每条文档的来源/页码/得分/摘要（JSON 可序列化 dict）。"""
+        self.info("retrieval", request_id=request_id, query=query, docs=docs)
+
+    def log_prompt(self, request_id: str, role: str, prompt: str) -> None:
+        """最终拼装的 prompt 全文（用户画像脱敏；问题本身保留用于质量审计）。"""
+        self.info("prompt", request_id=request_id, role=role, prompt=_redact(prompt))
+
+    def log_answer(self, request_id: str, answer: str, censor: dict | None = None) -> None:
+        """模型最终输出 + 内容审核结果（用户画像脱敏）。"""
+        self.info("answer", request_id=request_id, answer=_redact(answer), censor=censor)
+
 
 class _JsonFormatter(logging.Formatter):
     def format(self, record):
@@ -167,6 +190,17 @@ class _JsonFormatter(logging.Formatter):
         if extra:
             obj.update(extra)
         return json.dumps(obj, ensure_ascii=False)
+
+
+# 用户画像脱敏（身高/体重/目标属个人信息，日志明文落盘需替换）
+_PROFILE_PATTERN = re.compile(r"用户画像[：:]\s*[^\n]*")
+
+
+def _redact(text: str) -> str:
+    """日志脱敏：用户画像行替换为占位符；其余（问题/回答正文）保留用于审计。"""
+    if not text:
+        return text
+    return _PROFILE_PATTERN.sub("用户画像：[已脱敏]", text)
 
 
 def _slog(logger, level: str, event: str, **kwargs):
@@ -245,8 +279,13 @@ class _NoiseReducer:
         chars = list(text)
         return {"".join(chars[i:i+2]) for i in range(len(chars) - 1)}
 
-    def is_duplicate(self, query: str, session_id: str, session_state: dict) -> bool:
-        """与最近 N 条查询比较，超过相似度阈值返回 True。"""
+    def is_duplicate(self, query: str, session_id: str, session_state: dict,
+                     tag: str = "") -> bool:
+        """与最近 N 条查询比较，超过相似度阈值返回 True。
+
+        tag 区分请求模式（如 deep_thinking 开关）：同 query 不同 tag 不算重复——
+        模式切换是用户有意行为（如提示引导的"开深度思考重问"），不应被降噪拦截。
+        """
         if not self._cfg.noise_reduction_enabled:
             return False
 
@@ -255,7 +294,7 @@ class _NoiseReducer:
             recent = session_state.get(key, [])
 
             if not recent:
-                recent.append(query)
+                recent.append({"q": query, "tag": tag})
                 if len(recent) > self._cfg.noise_window:
                     recent.pop(0)
                 session_state[key] = recent
@@ -266,7 +305,9 @@ class _NoiseReducer:
                 return False
 
             for past in recent:
-                p_bigrams = self._bigrams(past)
+                if past.get("tag") != tag:
+                    continue  # 模式不同 → 切换模式重问是合法行为
+                p_bigrams = self._bigrams(past.get("q", ""))
                 if not p_bigrams:
                     continue
                 intersection = len(q_bigrams & p_bigrams)
@@ -280,7 +321,7 @@ class _NoiseReducer:
                                        query_hash=hashlib.md5(query.encode()).hexdigest()[:8])
                     return True
 
-            recent.append(query)
+            recent.append({"q": query, "tag": tag})
             if len(recent) > self._cfg.noise_window:
                 recent.pop(0)
             session_state[key] = recent
@@ -378,6 +419,13 @@ class _TokenBudgetGuard:
             _slog(self._log, 'error', "gateway_error", component="token_budget_guard", error=str(e))
             return context, None  # fail-open
 
+    @staticmethod
+    def _msg_content(m) -> str:
+        """兼容 dict（新版 langchain_community 存储格式）与 BaseMessage。"""
+        if isinstance(m, dict):
+            return m.get("content", "") or ""
+        return getattr(m, "content", "") or ""
+
     def _estimate_history(self, history_store: dict, session_id: str) -> int:
         """估算指定 session 的聊天历史总 tokens。"""
         try:
@@ -385,7 +433,7 @@ class _TokenBudgetGuard:
             if session is None:
                 return 0
             msgs = list(session.messages)
-            return sum(_estimate_tokens(m.content) for m in msgs)
+            return sum(_estimate_tokens(self._msg_content(m)) for m in msgs)
         except Exception:
             return 0
 
@@ -397,7 +445,7 @@ class _TokenBudgetGuard:
                 return
             msgs = list(session.messages)
             while len(msgs) > 2:
-                total = sum(_estimate_tokens(m.content) for m in msgs)
+                total = sum(_estimate_tokens(self._msg_content(m)) for m in msgs)
                 if total <= max_tokens:
                     break
                 msgs.pop(0)
@@ -497,15 +545,14 @@ class _MemoryGuard:
             return base_llm  # fail-open
 
     def _create_degraded_llm(self):
-        """懒加载降级小模型。Ollama 服务端复用已加载的 1.5B 进程，零额外显存。"""
+        """懒加载降级小模型（统一适配器 OllamaAdapter，去 langchain_ollama 依赖）。"""
         try:
-            from langchain_ollama import ChatOllama
+            from llm_adapter import OllamaAdapter
             import config as _cfg
-            return ChatOllama(
+            return OllamaAdapter(
                 model=self._cfg.memory_degraded_model,
-                temperature=0.7,
+                base_url=getattr(_cfg, "OLLAMA_BASE_URL", "http://localhost:11434"),
                 num_ctx=getattr(_cfg, "OLLAMA_NUM_CTX", 8192),
-                num_thread=getattr(_cfg, "OLLAMA_NUM_THREAD", None),
             )
         except Exception as e:
             _slog(self._log, 'error', "gateway_error", component="memory_guard_degraded_init", error=str(e))
@@ -547,13 +594,17 @@ class Gateway:
 
     # ---- Hook 1: 请求降噪 ----
 
-    def is_duplicate(self, query: str, session_id: str, session_state: dict = None) -> bool:
-        """返回 True 表示检测到近重复查询。需要传入 st.session_state。"""
+    def is_duplicate(self, query: str, session_id: str, session_state: dict = None,
+                     tag: str = "") -> bool:
+        """返回 True 表示检测到近重复查询。需要传入 st.session_state。
+
+        tag: 请求模式标签（如 "fast"/"deep"）——不同模式的同 query 不判重。
+        """
         if not self._cfg.enabled:
             return False
         if session_state is None:
             return False
-        return self._noise_reducer.is_duplicate(query, session_id, session_state)
+        return self._noise_reducer.is_duplicate(query, session_id, session_state, tag=tag)
 
     # ---- Hook 2: 令牌预算守卫 (Strategy A) ----
 
@@ -593,6 +644,24 @@ class Gateway:
         if not self._cfg.enabled:
             return
         _slog(self._log, 'info', event, **kwargs)
+
+    # ---- Hook 5: 完整日志（康养 Demo 扩展：query/检索片段/prompt/输出/token 消耗）----
+
+    def log_usage(self, request_id: str, role: str, usage) -> None:
+        if self._cfg.enabled:
+            self._log.log_usage(request_id, role, usage)
+
+    def log_retrieval(self, request_id: str, query: str, docs: list) -> None:
+        if self._cfg.enabled:
+            self._log.log_retrieval(request_id, query, docs)
+
+    def log_prompt(self, request_id: str, role: str, prompt: str) -> None:
+        if self._cfg.enabled:
+            self._log.log_prompt(request_id, role, prompt)
+
+    def log_answer(self, request_id: str, answer: str, censor: dict | None = None) -> None:
+        if self._cfg.enabled:
+            self._log.log_answer(request_id, answer, censor)
 
     # ---- 公开属性（供 UI 使用） ----
 

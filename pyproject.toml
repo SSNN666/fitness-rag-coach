@@ -23,8 +23,14 @@ dependencies = [
     "ddgs>=9.14.4",
     "requests>=2.34.2",
     "beautifulsoup4>=4.15.0",
+    "fastapi>=0.141.1",
 ]
 
 [[tool.uv.index]]
 url = "https://pypi.tuna.tsinghua.edu.cn/simple"
 default = true
+
+[dependency-groups]
+dev = [
+    "pytest>=9.1.1",
+]
