@@ -415,13 +415,13 @@ def test_cache_key_profile_fingerprint_when_tools_triggered():
 
 
 def test_rewrite_used_for_retrieval(monkeypatch):
-    """多轮指代问句 → 改写后的 retrieval_q 用于检索；原 question 仍进 Prompt。"""
+    """多轮指代问句（非禁忌动作）→ 改写后的 retrieval_q 用于检索；原 question 仍进 Prompt。"""
     import pipeline as pipeline_mod
     monkeypatch.setattr(pipeline_mod, "REFUSE_ENABLED", False)
     monkeypatch.setattr(pipeline_mod, "REWRITE_ENABLED", True)
     monkeypatch.setattr(pipeline_mod, "CRAG_ENABLED", False)
     monkeypatch.setattr(pipeline_mod, "rewrite_query",
-                        lambda q, h, llm: "腰突患者可以做硬拉吗")
+                        lambda q, h, llm: "腰突患者可以做臀桥吗")
 
     stop = threading.Event()
     retriever = _SearchableRetriever()
@@ -430,11 +430,58 @@ def test_rewrite_used_for_retrieval(monkeypatch):
         retriever=retriever,
         llms={"hyde": _SpyChain(stop), "chat_fast": chat_fast, "chat": _SpyChain(stop)},
         gateway=_FakeGateway(), fact_engine=None, fact_cache=None, store={})
-    svc._append_history("default", "腰突能深蹲吗", "不建议深蹲，会加重腰椎负担。")
-    svc.answer("那硬拉呢", session_id="default")
+    svc._append_history("default", "腰突怎么康复", "建议平板支撑等康复动作。")
+    svc.answer("那臀桥呢", session_id="default")
 
-    assert retriever.seen_queries and retriever.seen_queries[0] == "腰突患者可以做硬拉吗"
-    assert chat_fast.last_messages[-1]["content"] == "那硬拉呢"   # Prompt 用原问题
+    assert retriever.seen_queries and retriever.seen_queries[0] == "腰突患者可以做臀桥吗"
+    assert chat_fast.last_messages[-1]["content"] == "那臀桥呢"   # Prompt 用原问题
+
+
+def test_rewrite_contraindication_intercepted(monkeypatch):
+    """多轮改写补充的伤病实体 → 禁忌复查：改写后问题含禁忌动作 → 直接拒绝。
+
+    安全防线断链回归：改写前原问题「那硬拉呢」无伤病实体，Phase A 按「无需禁忌」放行；
+    改写后实体合并出「腰突」，必须重跑边界拒绝，否则硬拉（明确禁忌）会被正常推荐。
+    """
+    import pipeline as pipeline_mod
+    monkeypatch.setattr(pipeline_mod, "REWRITE_ENABLED", True)
+    monkeypatch.setattr(pipeline_mod, "rewrite_query",
+                        lambda q, h, llm: "腰突患者可以做硬拉吗")
+
+    stop = threading.Event()
+    svc = PipelineService(
+        retriever=_DummyRetriever(),   # get_contraindications → {} → 本地禁忌降级数据源
+        llms={"hyde": _SpyChain(stop), "chat_fast": _SpyChain(stop),
+              "chat": _SpyChain(stop)},
+        gateway=_FakeGateway(), fact_engine=None, fact_cache=None, store={})
+    svc._append_history("default", "腰突怎么康复", "建议平板支撑等康复动作。")
+    result = svc.answer("那硬拉呢", session_id="default")
+    assert result.refusal
+    assert "硬拉" in result.answer and "禁忌" in result.answer
+
+
+def test_rewrite_merged_contra_injected_into_prompt(monkeypatch):
+    """改写补充伤病但不含禁忌动作 → 不拒绝，但禁忌黑名单注入生成提示（防线仍在）。"""
+    import pipeline as pipeline_mod
+    monkeypatch.setattr(pipeline_mod, "REFUSE_ENABLED", False)
+    monkeypatch.setattr(pipeline_mod, "REWRITE_ENABLED", True)
+    monkeypatch.setattr(pipeline_mod, "CRAG_ENABLED", False)
+    monkeypatch.setattr(pipeline_mod, "rewrite_query",
+                        lambda q, h, llm: "腰突患者可以做划船吗")
+
+    stop = threading.Event()
+    retriever = _SearchableRetriever()
+    chat_fast = _CaptureChain(stop)
+    svc = PipelineService(
+        retriever=retriever,
+        llms={"hyde": _SpyChain(stop), "chat_fast": chat_fast, "chat": _SpyChain(stop)},
+        gateway=_FakeGateway(), fact_engine=None, fact_cache=None, store={})
+    svc._append_history("default", "腰突怎么康复", "建议平板支撑等康复动作。")
+    result = svc.answer("那划船呢", session_id="default")
+    assert not result.refusal
+    sys_content = chat_fast.last_messages[0]["content"]
+    assert "伤病禁忌黑名单" in sys_content and "深蹲" in sys_content   # 合并后的禁忌注入
+    assert retriever.seen_queries[0] == "腰突患者可以做划船吗"
 
 
 def test_rewrite_disabled_uses_original_question(monkeypatch):

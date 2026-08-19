@@ -31,7 +31,6 @@ import threading
 import uuid
 from dataclasses import dataclass, field
 
-from langchain_community.chat_message_histories import ChatMessageHistory
 from pymilvus import MilvusClient
 
 from config import *
@@ -120,6 +119,22 @@ class PipelineResult:
     error: str | None = None
 
 
+class _SessionHistory:
+    """轻量会话存储（替代 langchain_community ChatMessageHistory——该包已停维弃用）。
+
+    接口保持兼容（messages / add_message / clear），gateway 令牌预算守卫直接可用。
+    """
+
+    def __init__(self):
+        self.messages: list = []
+
+    def add_message(self, msg) -> None:
+        self.messages.append(msg)
+
+    def clear(self) -> None:
+        self.messages = []
+
+
 # ============================================================
 # PipelineService
 # ============================================================
@@ -171,25 +186,10 @@ class PipelineService:
             self._stage(on_stage, "正在分析问题与禁忌约束…")
             entities = FitnessRAGRetriever._extract_entities(question)
             injury_names = entities.get("injury", [])
-            forbidden: list[str] = []
-            contra_text = "（当前查询无伤病，无需禁忌约束）"
-            contra_hit = False
-            if injury_names:
-                contra_map = self._retriever.get_contraindications(injury_names)
-                if not contra_map and not NEO4J_ENABLED:
-                    # 本地降级：图谱停机时用内置禁忌数据副本（核心安全数据不依赖单一外部服务）
-                    contra_map = self._local_contraindications(injury_names)
-                if contra_map:
-                    contra_hit = True
-                    forbidden = list({a for acts in contra_map.values() for a in acts})
-                    lines = ["\n\n【伤病禁忌黑名单 — 绝对禁止出现在回答中】"]
-                    for inj, actions in contra_map.items():
-                        lines.append(f"- {inj}禁忌: {', '.join(actions)}")
-                    contra_text = "\n".join(lines)
-                else:
-                    contra_text = "（该伤病在知识库中暂无禁忌记录）"
+            contra_map, forbidden, contra_text, contra_hit = \
+                self._resolve_contraindications(injury_names)
 
-            # 边界拒绝（核心诉求=禁忌动作）
+            # 边界拒绝（核心诉求=禁忌动作）；多轮改写后的复查见 Phase C
             hit_action = self._contraindicated_request(question, forbidden)
             if hit_action:
                 reason = self._contraindication_reason(injury_names, hit_action)
@@ -209,9 +209,11 @@ class PipelineService:
             # 历史快照在锁内读取，改写本身放锁外（云端 LLM 调用）
             history_snapshot: list = []
             do_rewrite = False
+            phase_a_injuries: list = []   # 改写前的伤病快照（Phase C 复查时比对新增）
             if REWRITE_ENABLED:
                 history_snapshot = self._history_messages(session_id)
                 do_rewrite = needs_rewrite(question, history_snapshot)
+                phase_a_injuries = list(injury_names)
 
         self._stage(on_stage, "已完成安全分析，正在检索知识库…")
         if self._cancelled(stop_event):
@@ -223,6 +225,14 @@ class PipelineService:
         retrieval_q = question
         if do_rewrite:
             retrieval_q = rewrite_query(question, history_snapshot, self._llms["hyde"])
+            # 改写后的查询可能补充伤病上下文（「那硬拉呢」→「腰突患者可以做硬拉吗」）：
+            # 合并实体供 Phase C 补查禁忌 + 重跑边界拒绝——原问题无伤病实体时
+            # Phase A 已按「无需禁忌约束」放行，多轮语境必须复查（防安全防线断链）
+            _rewritten = FitnessRAGRetriever._extract_entities(retrieval_q)
+            for etype in set(entities) | set(_rewritten):
+                entities[etype] = list(dict.fromkeys(entities.get(etype, [])
+                                                     + _rewritten.get(etype, [])))
+            injury_names = entities.get("injury", [])
         # simple 层跳过 HyDE 直查（HYDE_SKIP_SIMPLE）：基础问答直查已满分，省 1 次 LLM 调用
         drafts = None
         if HYDE_ENABLED and not (tier == "simple" and HYDE_SKIP_SIMPLE):
@@ -250,6 +260,17 @@ class PipelineService:
             except Exception:
                 pass   # 内存检测失败不影响主链路
         with self._lock:
+            # 多轮改写复查：改写补充了伤病实体 → 补查禁忌 + 重跑边界拒绝
+            # （Phase A 按原问题实体放行；此处用改写后合并实体重新上安全闸门）
+            if do_rewrite and injury_names != phase_a_injuries:
+                contra_map, forbidden, contra_text, contra_hit = \
+                    self._resolve_contraindications(injury_names)
+                hit_action = self._contraindicated_request(question, forbidden)
+                if hit_action:
+                    reason = self._contraindication_reason(injury_names, hit_action)
+                    result.answer = self._reject_message(hit_action, injury_names, reason)
+                    result.refusal = True
+                    return result
             q_emb = None
             try:
                 # 注：hyde_retrieve 必须先于 search_with_scores——其内部检索会把
@@ -576,6 +597,26 @@ class PipelineService:
                         result[key] = forbidden
         return result
 
+    def _resolve_contraindications(self, injury_names: list[str]) -> tuple[dict, list[str], str, bool]:
+        """伤病名列表 → (contra_map, forbidden, contra_text, contra_hit)。
+
+        图谱优先（NEO4J_ENABLED），停机时本地降级（contra_data 副本，单一数据源）。
+        Phase A（原问题实体）与 Phase C（多轮改写合并实体）共用，保证两处口径一致。
+        """
+        if not injury_names:
+            return {}, [], "（当前查询无伤病，无需禁忌约束）", False
+        contra_map = self._retriever.get_contraindications(injury_names)
+        if not contra_map and not NEO4J_ENABLED:
+            # 本地降级：图谱停机时用内置禁忌数据副本（核心安全数据不依赖单一外部服务）
+            contra_map = self._local_contraindications(injury_names)
+        if contra_map:
+            forbidden = list({a for acts in contra_map.values() for a in acts})
+            lines = ["\n\n【伤病禁忌黑名单 — 绝对禁止出现在回答中】"]
+            for inj, actions in contra_map.items():
+                lines.append(f"- {inj}禁忌: {', '.join(actions)}")
+            return contra_map, forbidden, "\n".join(lines), True
+        return {}, [], "（该伤病在知识库中暂无禁忌记录）", False
+
     @staticmethod
     def _contraindication_reason(injuries: list[str], action: str) -> str | None:
         """从禁忌数据单一来源查拒绝原因（contra_data 与图谱构建共用一份数据）。"""
@@ -872,7 +913,7 @@ class PipelineService:
         self._touch(session_id)  # 读取也是访问（LRU 语义）
         out = []
         for m in session.messages:
-            # 兼容 dict（新版 langchain_community 存储格式）与 BaseMessage 两种形态
+            # 兼容 dict（{type, content} 存储格式）与 BaseMessage 两种形态
             if isinstance(m, dict):
                 mtype = m.get("type") or m.get("role") or "user"
                 role = {"human": "user", "ai": "assistant", "system": "system"}.get(mtype, "user")
@@ -884,7 +925,7 @@ class PipelineService:
 
     def _append_history(self, session_id: str, question: str, answer: str) -> None:
         if session_id not in self._store:
-            self._store[session_id] = ChatMessageHistory()
+            self._store[session_id] = _SessionHistory()
         session = self._store[session_id]
         session.add_message({"type": "human", "content": question})
         session.add_message({"type": "ai", "content": answer})

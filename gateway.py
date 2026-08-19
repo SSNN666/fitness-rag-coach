@@ -435,7 +435,7 @@ class _TokenBudgetGuard:
 
     @staticmethod
     def _msg_content(m) -> str:
-        """兼容 dict（新版 langchain_community 存储格式）与 BaseMessage。"""
+        """兼容 dict（{type, content} 存储格式）与 BaseMessage。"""
         if isinstance(m, dict):
             return m.get("content", "") or ""
         return getattr(m, "content", "") or ""
@@ -632,7 +632,7 @@ class Gateway:
     ) -> str:
         """
         级联截断 → 返回安全 context。
-        history_store 应为 st.session_state.store（ChatMessageHistory 字典）。
+        history_store 应为会话 store（_SessionHistory 字典，与 langchain ChatMessageHistory 接口兼容）。
         内部可能裁剪 history_store 中的消息。
         """
         if not self._cfg.enabled:

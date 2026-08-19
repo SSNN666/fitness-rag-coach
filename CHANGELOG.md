@@ -1,5 +1,19 @@
 # 变更记录
 
+## 🔒 2026-08-19 安全修复 + 工程收尾批次
+
+**前置**：产品闭环批次自检发现——多轮改写把伤病上下文带进了检索 query，但禁忌检查仍基于原问题实体，
+「那硬拉呢」改写后安全防线（禁忌黑名单/边界拒绝/硬过滤）全部失效 → 修复；另收尾弃用依赖与性能弹药。
+
+| # | 项 | 文件 | 说明 |
+|---|---|---|---|
+| 1 | 多轮改写禁忌复查 | pipeline.py | 改写后（Phase B）合并实体 → Phase C 锁内补查禁忌 + **重跑边界拒绝**：原问题「那硬拉呢」改写为「腰突患者可以做硬拉吗」后，合并出「腰突」→ 硬拉（明确禁忌）直接拒绝；非禁忌追问（「那臀桥呢」）不拒绝但禁忌黑名单注入生成提示。抽出 `_resolve_contraindications` 供 Phase A/C 共用，两处口径一致 |
+| 2 | 去弃用依赖 | pipeline.py / gateway.py | langchain_community ChatMessageHistory（官方已停维）→ 自带 `_SessionHistory`（10 行，接口兼容）；测试唯一 DeprecationWarning 消除 |
+| 3 | 压测脚本 | bench_stream.py（新）/ README.md | 并发档独立 session（绕过网关降噪）；P50/P95/P99 首 token/总延迟 + token 吞吐；实测：1→4 并发吞吐 189→368 token/s（约 2×，封顶为 MaaS 单 Key 并发额度），首 token 1.5s 固定开销 |
+| 4 | 测试 | tests/test_pipeline.py | +2 项（改写禁忌拦截 / 改写合并禁忌注入），改 1 项（原「那硬拉呢」检索用例改为非禁忌「那臀桥呢」——修复后拒绝是正确行为）；**143/143** |
+
+---
+
 ## 🎯 2026-08-19 产品闭环批次（工具层 / 多轮改写 / 反馈闭环 / 检索 debugger）
 
 **前置**：与 GitHub 同类项目（rag-health-assistant / medical-rag-assistant 等）对比发现四个真实差距——

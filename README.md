@@ -136,6 +136,25 @@ curl "http://127.0.0.1:8000/v1/debug/retrieval?request_id=<request_id>" -H "X-AP
 - **Embedding 上云**：qwen3.7-text-embedding（dimensions=768 与 schema 一致，实测批量 41 条/s、8 并发 0.26s 无排队）——检索与本地资源解耦。⚠️ 切换 `EMBEDDING_PROVIDER` 必须重建索引（不同模型向量空间不兼容），并重新校准 `GROUNDING_MIN_SIM`（qwen 嵌入实测校准 0.40）
 - 快模型选型实测：qwen3.7-flash 优于 deepseek-v4-flash / glm-5.2-fast-preview（短任务 0.3s vs 0.9s）
 
+## 📊 压测基准（bench_stream.py）
+
+```bash
+python bench_stream.py                    # 默认 2/4/8 并发（各档独立 session 绕过网关降噪）
+python bench_stream.py --concurrency 1,2,4 --question "腰突怎么康复"   # 指定档位/题型
+```
+
+实测（2026-08-19，DashScope 主链 qwen3.7-flash，simple 层快速模式，问题「深蹲主要锻炼哪些肌群」）：
+
+| 并发 | 墙钟 | 首 token P50 | 总延迟 P50 / P99 | 吞吐 |
+|---|---|---|---|---|
+| 1 | 2.7s | 1.5s | 2.7s / 2.7s | 189 token/s |
+| 2 | 5.3s | 2.6s | 5.3s / 5.3s | 189 token/s |
+| 4 | 5.3s | 2.5s | 4.9s / 5.3s | 368 token/s |
+
+> 解读：吞吐 1→4 并发约 2×（非 4×）——**封顶因素为 MaaS 单 Key 并发额度**
+> （检索锁内串行是 Milvus Lite 约束，云端生成锁外并行不受影响）；首 token 1.5s 为
+> 「网关 + 检索 + grounding 判定」的固定开销，分层策略的 simple 快模型已把生成期压到 ~1s。
+
 ## 🔻 降级链触发条件
 
 | 错误分类 | 判定 | 处理 |
@@ -151,7 +170,7 @@ curl "http://127.0.0.1:8000/v1/debug/retrieval?request_id=<request_id>" -H "X-AP
 ## 🧪 测试
 
 ```bash
-pytest -q tests/                    # 141 项：适配器降级链/注入/拒答/乱码/API 集成/引用清洗/拒绝原因/网关防护/图谱/断连取消/供应商参数隔离/分类器回归/健康工具/多轮改写/反馈/检索 debugger（mock 打桩）
+pytest -q tests/                    # 143 项：适配器降级链/注入/拒答/乱码/API 集成/引用清洗/拒绝原因/网关防护/图谱/断连取消/供应商参数隔离/分类器回归/健康工具/多轮改写/禁忌复查/反馈/检索 debugger（mock 打桩）
 python -u eval_graph.py             # 图谱检索专项评测（mock 确定性；--neo4j 切真实实例）
 python -u eval_testset.py --skip-groups --limit 100   # 检索+生成评测（本地 Ollama）
 python -u eval_testset.py --rrf --limit 20            # RRF 融合模式对比
@@ -255,7 +274,8 @@ python -u eval_testset.py --cloud --limit 20          # 云端评测（需 DASHS
 ├── build_index.py         # 索引构建（OCR 质检 + Milvus + BM25 + [Neo4j]）
 ├── ingest_pdf.py          # 单 PDF 摄入脚本
 ├── pdf_ocr.py             # cnocr 并行 OCR + 缓存
-├── eval_testset.py        # 评测（适配器统一，--cloud/--rrf）
+├── eval_testset.py        # 评测（适配器统一，--cloud/--rrf/--feedback）
+├── bench_stream.py        # 并发压测（P50/P95/P99 首 token/总延迟 + token 吞吐）
 ├── config.py              # 全局配置（密钥走 .env）
 ├── tests/                 # pytest 77 项
 └── eval_results_final.csv # 历史优化记录
