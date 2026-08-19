@@ -53,6 +53,5 @@ Thumbs.db
 # 屏幕截图等临时文件
 屏幕截图*.png
 
-# 依赖文件（除了 pyproject.toml 和 requirements.txt 外，其他的类似 .uv 缓存可以忽略）
+# uv 缓存（uv.lock 必须入库：CI `uv sync --frozen` 依赖它与 pyproject 同步）
 .uv/
-uv.lock
