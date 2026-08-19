@@ -1,5 +1,66 @@
 # 变更记录
 
+## 🎯 2026-08-19 产品闭环批次（工具层 / 多轮改写 / 反馈闭环 / 检索 debugger）
+
+**前置**：与 GitHub 同类项目（rag-health-assistant / medical-rag-assistant 等）对比发现四个真实差距——
+① llm_adapter 已实现 tools 协议但 pipeline 零使用；② 会话历史只进 messages，检索无指代消解；
+③ 测试集一次性人工构建，无用户反馈回路；④ gateway.log 有全量检索数据但无对外接口。全部补齐。
+
+| # | 项 | 文件 | 说明 |
+|---|---|---|---|
+| 1 | 确定性健康工具层 | health_tools.py（新）/ pipeline.py / config.py | BMI/饮水量/心率区间三工具：注册表结构（可演进 tools 协议）、关键词触发、参数优先取画像、缺参数不硬算；结果注入上下文顶部（令牌预算截断前，头部不被误伤）+ kind=tool 引用；**缓存 key 联动**：工具触发时追加画像指纹——同问题不同画像不复用旧缓存（原 key 不含 user_profile 的既有隐患） |
+| 2 | 多轮查询改写 | hyde.py / pipeline.py | `needs_rewrite`（指代词/无实体判定）+ `rewrite_query`（hyde 小模型 64 token，异常/空/超长回退原问题）；改写后 retrieval_q 仅用于检索（HyDE 草稿与 search 同用），原问题保留在 Prompt/分层/FactCache key；检索日志记录实际 query（可审计） |
+| 3 | 反馈闭环 | api.py / app.py / eval_testset.py | `POST /v1/feedback`：recent_answers（200 条内按 request_id 解析问题/回答）→ feedback.jsonl；Streamlit 👍/👎 按钮（历史+当前 run 双渲染，key 防冲突）；`eval_testset.py --feedback`：负反馈问题回流评测（无金标准 → 跳过 Hit@k 口径，跑逐条检索诊断 + faithfulness/relevancy） |
+| 4 | 检索 debugger | log_reader.py（新）/ api.py / app.py | `GET /v1/debug/retrieval?request_id=` 与 `/recent?limit=`（require_api_key，limit clamp 1-50）；解析 gateway.log JSON Lines（坏行/轮转容错）；UI「🔍 检索详情」展开器按 request_id 展示每路来源/得分 |
+| 5 | 测试 | tests/ | 新增 40 项：工具计算/触发/参数抽取、改写判定与三路回退、工具注入 ctx、改写检索透传（开关回归）、反馈落盘/404/鉴权、debug 端点/clamp —— 延续 mock 打桩风格，零外部服务 |
+
+**验证**：pytest **141/141** 通过（原 101 + 新增 40），零回归；CI（mock 打桩）无需外部服务。
+
+---
+
+## ⚡ 2026-08-19 检索优化批次（simple 直查提速 + 图谱专项评测）
+
+**前置**：上批工程加固后，按 P1 优化方向落地两项——simple 层跳过 HyDE（省 1 次 LLM + 1 次检索）、
+图谱 multi-hop 专项评测（mock 确定性评测驱动修复 4 个图谱逻辑 bug）。
+
+| # | 项 | 文件 | 说明 |
+|---|---|---|---|
+| 1 | simple 层跳过 HyDE | config.py / pipeline.py | `HYDE_SKIP_SIMPLE=True`：基础问答直查 Hit@3=1.00 已满分；实测 20 条对比直查 0.95/1.00/1.00 vs HyDE 1.00/1.00/1.00（仅 1 条首命中降级）；**省 1 次 LLM 调用 + 1 次重复检索**（原 simple 层同 query 同 k 搜两次） |
+| 2 | 图谱专项评测 | eval_graph.py | mock 图谱（contra_data 自动构造）确定性评测：单伤病禁忌召回/复合双伤病覆盖/评分校验/矛盾标注；`--neo4j` 切真实实例 |
+| 3 | 关系评分双源匹配 | retriever.py | `_score_relation` 曾从 description 判分，但标签在关系类型名里（Neo4j 停用期不可见）→ `_relation_label` 双源提取 |
+| 4 | multi-hop 评分公式 | retriever.py | `1/hops` 让 1-hop 康复=1.0 与禁忌无区分 → 标签基础分（禁忌1.0/康复0.9/谨慎0.7）× 深度衰减 + 禁忌 boost |
+| 5 | 先排序再截断 | retriever.py | one_hop/multi_hop 曾先 `[:k]` 截断后排序 → 高分禁忌路径被挤出 top-k |
+| 6 | 复合判定修复 | retriever.py / hyde.py | ①部位名是伤病名组成部分不算复合（"膝关节积液"）；②实体词典贪心计数（"肩袖损伤"整体 1 个）；③标记词独立判定（"综合征"含"综合"子串不触发） |
+| 7 | 分类器回归测试 | tests/test_hyde.py | 单伤病误判复合的 5 类回归用例 + 独立标记判定 |
+
+**评测结果**：单伤病禁忌召回@5 68.4%→**100%**、Top-1 禁忌 100%、复合双伤病覆盖 0%→**100%**、
+校验 3/3 PASS；pytest **101/101**。
+
+---
+
+## 🛠️ 2026-08-18 工程加固批次（代码分析驱动的修复 + 优化）
+
+**前置**：全量代码走读发现 3 个中等缺陷（SSE 断连线程泄漏 / enable_thinking 字段泄漏 / 图谱冲突检测死代码）+
+ 4 个低危项（注释不符 / usage 双记 / banner 死代码 / 冗余 embedding）→ 全部修复并补测试。
+
+| # | 项 | 文件 | 说明 |
+|---|---|---|---|
+| 1 | enable_thinking 参数隔离 | llm_adapter.py | DashScope 混合思考专属字段不再下发 DeepSeek/千帆（OpenAI 兼容端点可能 400 拒绝 → 链路形同虚设） |
+| 2 | 图谱冲突检测修复 | retriever.py | 关系标签写入 doc metadata + 标签归一比较（禁忌/康复/谨慎），「矛盾标注」提示首次可触发 |
+| 3 | 语义去重开关接线 | retriever.py | FUSION_SEMANTIC_DEDUP_ENABLED 此前从未被读取 → 融合无条件跑候选两两余弦 + N 次 embedding；默认关 |
+| 4 | SSE 断开保护 | api.py / pipeline.py | GeneratorExit → stop_event → 流水线阶段边界/流式循环逐块检查退出，worker 不再空转（最长 300s LLM 调用） |
+| 5 | SSE 事件驱动排空 | api.py | 50ms 固定轮询 → `queue.get(timeout)` 阻塞等待，delta 一到即透出、无感知延迟 |
+| 6 | query 向量复用 | retriever.py / pipeline.py | `_last_query_embedding` 锁内缓存，grounding 相关性判定复用检索向量，每请求省 1 次 embedding |
+| 7 | usage 双记修复 | pipeline.py | chat_nothink/chat_fast 去掉 background on_usage，主链调用只按 request_id 记一次 |
+| 8 | 内存降级横幅接线 | api.py / app.py | meta 帧透出 `banner` + UI st.warning 展示（此前 get_degraded_banner 无调用方） |
+| 9 | 卫生 | .gitignore | `屏幕截图*.png` 不入库 |
+| 10 | 测试 | tests/ | 新增 11 项（参数隔离/冲突检测/去重开关/向量复用/断连取消/stop_event 透传），**92/92 通过** |
+
+**修复过程中额外发现**：① `FUSION_SEMANTIC_DEDUP_ENABLED=False` 配置形同虚设（死开关，真实开销比预想大）；
+② pipeline 取消路径返回值需保留部分答案；③ `from config import *` 使测试 monkeypatch 需作用于 pipeline 模块本身。
+
+---
+
 ## 🏁 2026-08-14 今日总览（14 项工作，详见下方各节）
 
 **上午 → 深夜全链路**：项目分析 → 图谱可视化 → 知识库换血 → 安全细化 → 一键启动 → 两批工程改进 → 评测体系重建。

@@ -19,18 +19,23 @@ from __future__ import annotations
 
 import json
 import logging
+import queue
 import secrets
 import threading
 import time
 import uuid
 from contextlib import asynccontextmanager
+from datetime import datetime, timezone
+from typing import Literal
 
 from fastapi import Depends, FastAPI, File, Form, Header, HTTPException, UploadFile
 from fastapi.responses import RedirectResponse, Response, StreamingResponse
 from pydantic import BaseModel, Field
 
+import log_reader
 from config import (
-    API_KEY_AUTH, LLM_PROVIDER_PRIMARY, MAX_QUERY_CHARS, NEO4J_ENABLED, SSE_CHUNK_CHARS,
+    API_KEY_AUTH, FEEDBACK_MAX_RECENT, FEEDBACK_PATH, LLM_PROVIDER_PRIMARY,
+    MAX_QUERY_CHARS, NEO4J_ENABLED, SSE_CHUNK_CHARS,
 )
 from content_moderation import build_censor
 from guardrails import detect_injection
@@ -78,6 +83,12 @@ class VisionResponse(BaseModel):
     available: bool = True
 
 
+class FeedbackRequest(BaseModel):
+    request_id: str = Field(min_length=1, max_length=64)
+    vote: Literal["up", "down"]
+    comment: str = Field(default="", max_length=500)
+
+
 # ============================================================
 # 鉴权（演示级：X-API-Key + 常数时间比较；API_KEY_AUTH 为空 = 本地免鉴权）
 # ============================================================
@@ -97,6 +108,7 @@ async def lifespan(app: FastAPI):
     app.state.pipeline = build_pipeline()
     app.state.censor = build_censor()
     app.state.gw_state = {}   # 网关限流/降噪的会话状态（替代 st.session_state）
+    app.state.recent_answers = {}   # 最近应答（request_id → 内容，反馈解析用）
     app.state.vision_llm = build_llm("vision")  # P2：本地无 VL → active_providers 为空
     _log.info("lifespan: ready. chat chain=%s vision chain=%s neo4j=%s",
               app.state.pipeline._llms["chat"].active_providers,
@@ -136,6 +148,21 @@ def _usage_to_dict(u) -> dict:
         "prompt_tokens": u.prompt_tokens, "completion_tokens": u.completion_tokens,
         "total_tokens": u.total_tokens, "latency_ms": u.latency_ms,
     }
+
+
+def _remember_request(store: dict, request_id: str, question: str, answer: str,
+                      session_id: str) -> None:
+    """记录最近应答供反馈解析（上限 FEEDBACK_MAX_RECENT，超限驱逐最旧）。
+
+    线程安全说明：dict 单键写 + GIL 原子，demo 规模足够（与网关限流状态同级别）。
+    """
+    store[request_id] = {
+        "request_id": request_id, "question": question, "answer": answer,
+        "session_id": session_id, "ts": time.time(),
+    }
+    if len(store) > FEEDBACK_MAX_RECENT:
+        oldest = min(store, key=lambda k: store[k]["ts"])
+        store.pop(oldest, None)
 
 
 # ============================================================
@@ -190,6 +217,8 @@ def chat(req: ChatRequest):
     result = app.state.pipeline.answer(
         req.question, req.session_id, req.user_profile, request_id,
         deep_thinking=req.deep_thinking)
+    _remember_request(app.state.recent_answers, request_id,
+                      req.question, result.answer, req.session_id)
 
     censor = app.state.censor
     answer = result.answer
@@ -258,7 +287,61 @@ def vision(file: UploadFile = File(...),
     )
 
 
+@app.post("/v1/feedback", dependencies=[Depends(require_api_key)])
+def feedback(req: FeedbackRequest):
+    """用户反馈（👍/👎）：按 request_id 解析出问题与回答，追加写 feedback.jsonl。
+
+    评测闭环：eval_testset.py --feedback 读取负反馈问题跑质量报告——
+    测试集不再是一次性人工构建，真实用户不满意的样本回流到评测。
+    """
+    entry = app.state.recent_answers.get(req.request_id)
+    if entry is None:
+        raise HTTPException(
+            status_code=404,
+            detail=f"该 request_id 不存在或已过期（仅保留最近 {FEEDBACK_MAX_RECENT} 条请求）")
+    record = {**entry, "vote": req.vote, "comment": req.comment,
+              "feedback_ts": datetime.now(timezone.utc).isoformat()}
+    try:
+        with open(FEEDBACK_PATH, "a", encoding="utf-8") as f:
+            f.write(json.dumps(record, ensure_ascii=False) + "\n")
+    except OSError as e:
+        raise HTTPException(status_code=500, detail=f"反馈写入失败: {e}")
+    return {"ok": True, "request_id": req.request_id}
+
+
+@app.get("/v1/debug/retrieval", dependencies=[Depends(require_api_key)])
+def debug_retrieval(request_id: str):
+    """检索详情：按 request_id 返回该请求的检索文档与得分（调试/演示用）。
+
+    演示时当场展示「这个问题三路检索各给了多少分」的中间过程；
+    数据来自 gateway.log 结构化日志（pipeline 每请求写一次）。
+    """
+    ev = log_reader.find_retrieval_event(request_id)
+    if ev is None:
+        raise HTTPException(status_code=404, detail="未找到该请求的检索记录（可能未启用日志或已轮转）")
+    return {"query": ev.get("query", ""), "docs": ev.get("docs", [])}
+
+
+@app.get("/v1/debug/retrieval/recent", dependencies=[Depends(require_api_key)])
+def debug_retrieval_recent(limit: int = 10):
+    """最近 N 条检索请求摘要（调试/演示用）。"""
+    limit = max(1, min(limit, 50))
+    events = log_reader.recent_retrieval_events(limit)
+    return {"events": [
+        {"request_id": e.get("request_id", ""), "query": e.get("query", ""),
+         "n_docs": len(e.get("docs", []))} for e in events]}
+
+
 def _sse_gen(req: ChatRequest, request_id: str):
+    """SSE 真流式:token 级 delta 实时透出(降级链 stream_events),生成后补权威全文。
+
+    事件序:meta → status* → delta*(token 级) → citations → answer → done | error
+    - answer 帧为事实核查/硬过滤后的权威全文,前端以此覆盖增量区
+    - 输出审核在生成后执行:不通过 → answer 帧替换为屏蔽提示(真流式下的固有取舍,
+      增量区已展示的内容由前端按 answer 帧覆盖)
+    - 客户端断开(GeneratorExit) → stop_event 通知 worker 线程及时退出,
+      避免 LLM 调用继续空转（pipeline 流式循环逐块检查）
+    """
     pipeline: PipelineService = app.state.pipeline
     gateway = pipeline._gateway
     censor = app.state.censor
@@ -267,8 +350,9 @@ def _sse_gen(req: ChatRequest, request_id: str):
         payload = {"event": event, **data}
         return f"data: {json.dumps(payload, ensure_ascii=False)}\n\n"
 
-    # meta 先行：前端立即有反馈
-    yield evt("meta", {"request_id": request_id, "provider": LLM_PROVIDER_PRIMARY})
+    # meta 先行：前端立即有反馈（内存降级横幅仅首次降级时非空）
+    yield evt("meta", {"request_id": request_id, "provider": LLM_PROVIDER_PRIMARY,
+                       "banner": gateway.get_degraded_banner()})
 
     # 1. 注入检测 + 输入审核（同步、流式前）
     blocked, msg, detail = _guard_input(req.question, censor)
@@ -288,47 +372,72 @@ def _sse_gen(req: ChatRequest, request_id: str):
                             "kind": "duplicate"})
         return
 
-    # 3. 12 步流水线（后台线程执行；status 帧实时播报阶段进度）
-    #    缓冲模式下等待期零反馈是「感觉慢」的主因——进度帧不缩短耗时但大幅改善感知
+    # 3. 流水线（后台线程）:阶段进度 + token 级 delta 经线程安全队列透出
     progress: list[str] = []
     progress_lock = threading.Lock()
+    delta_q: queue.Queue = queue.Queue()
 
     def _on_stage(name: str) -> None:
         with progress_lock:
             progress.append(name)
 
+    def _on_delta(text: str) -> None:
+        delta_q.put(text)
+
     result_box: dict = {}
+    stop_event = threading.Event()
 
     def _run_pipeline() -> None:
         try:
             result_box["result"] = pipeline.answer(
                 req.question, req.session_id, req.user_profile, request_id,
-                deep_thinking=req.deep_thinking, on_stage=_on_stage)
+                deep_thinking=req.deep_thinking,
+                on_stage=_on_stage, on_delta=_on_delta, stop_event=stop_event)
         except Exception as e:  # 兜底：后台异常不悬挂 SSE，转 error 帧
             _log.error("pipeline_worker_error rid=%s err=%s", request_id, str(e)[:200])
             result_box["error"] = str(e)[:200]
 
     worker = threading.Thread(target=_run_pipeline, daemon=True)
     worker.start()
+
     sent = 0
-    while worker.is_alive():
-        with progress_lock:
-            pending, sent = progress[sent:], len(progress)
-        for name in pending:
-            yield evt("status", {"stage": name})
-        time.sleep(0.25)
-    worker.join()
-    with progress_lock:
-        pending, sent = progress[sent:], len(progress)
-    for name in pending:
-        yield evt("status", {"stage": name})
+    try:
+        while worker.is_alive() or not delta_q.empty():
+            # 优先排空 token 增量(减小流式延迟),再播报阶段进度
+            drained = False
+            while True:
+                try:
+                    text = delta_q.get_nowait()
+                except queue.Empty:
+                    break
+                drained = True
+                yield evt("delta", {"text": text})
+            with progress_lock:
+                pending, sent = progress[sent:], len(progress)
+            for name in pending:
+                yield evt("status", {"stage": name})
+            if not drained:
+                # 无增量时阻塞等待（替代固定 50ms 轮询）：delta 一到即透出，无感知延迟
+                try:
+                    text = delta_q.get(timeout=0.2)
+                    yield evt("delta", {"text": text})
+                except queue.Empty:
+                    pass
+        worker.join()
+    except GeneratorExit:
+        # 客户端断开：通知 worker 及时从 LLM 流式循环退出（daemon 线程不悬挂）
+        stop_event.set()
+        worker.join(timeout=5.0)
+        raise
 
     if result_box.get("error") or result_box.get("result") is None:
         yield evt("error", {"message": "服务处理失败，请重试。"})
         return
     result = result_box["result"]
+    _remember_request(app.state.recent_answers, request_id,
+                      req.question, result.answer, req.session_id)
 
-    # 4. 输出审核（展示前——缓冲模式的核心：审核完成后才发 delta）
+    # 4. 输出审核（生成后;增量区已展示的内容由 answer 帧兜底覆盖）
     censor_note = None
     if censor is not None and not result.refusal:
         cr = censor.check_text(result.answer, task="RAG_QA_OUTPUT")
@@ -336,14 +445,12 @@ def _sse_gen(req: ChatRequest, request_id: str):
             result.answer = "该回答未通过内容审核，已屏蔽。请换一种问法。"
             censor_note = cr.conclusion
 
-    # 5. 分块吐出（视觉流式）
+    # 5. 权威全文 + 引用 + 完成
     text = result.answer
-    for i in range(0, len(text), SSE_CHUNK_CHARS):
-        yield evt("delta", {"text": text[i:i + SSE_CHUNK_CHARS]})
-
     yield evt("citations", {
         "docs": result.citations, "grounded": result.grounded, "refusal": result.refusal,
     })
+    yield evt("answer", {"text": text})   # 事实核查/硬过滤后的最终全文
     yield evt("done", {
         "usage": [_usage_to_dict(u) for u in result.usage],
         "fallback_active": result.fallback_active,

@@ -10,10 +10,15 @@ HyDE (Hypothetical Document Embeddings) 模块
 """
 
 from config import (
-    HYDE_INJURY_KEYWORDS, HYDE_COMPOUND_MARKERS, HYDE_TOP_K,
+    HYDE_COMPOUND_MARKERS, HYDE_TOP_K,
     STEP_BACK_ENABLED, DECOMPOSE_ENABLED,
     MULTI_QUERY_TOP_K, MAX_SUB_QUESTIONS, MAX_TOTAL_DOCS,
 )
+
+import re
+
+# 中文字符（用于复合标记词的独立出现判定）
+_HAN_CHAR = re.compile(r"[一-鿿]")
 
 
 # ============================================================
@@ -22,7 +27,7 @@ from config import (
 
 def classify_query(question: str) -> str:
     """
-    基于关键词规则匹配，将用户查询分为三类。
+    基于规则分类，将用户查询分为三类（simple / single_injury / compound_injury）。
 
     Args:
         question: 用户原始查询字符串
@@ -31,33 +36,115 @@ def classify_query(question: str) -> str:
         "simple"         — 无伤病关键词的普通健身问答
         "single_injury"  — 涉及单个伤病/体态问题的查询
         "compound_injury" — 涉及多个伤病或体态问题的复合查询
+
+    实体计数用 retriever 实体词典贪心最长匹配（"肩袖损伤"整体算 1 个实体——
+    早期按关键词粗计数会把"肩袖"+"损伤"拆成 2 个，误判复合伤病，检索走 3-hop 浪费）。
     """
     q = question.strip()
 
-    # 1. 找出所有命中的伤病关键词
-    found_keywords = [kw for kw in HYDE_INJURY_KEYWORDS if kw in q]
+    # 1. 实体词典贪心抽取伤病/部位（单字组合词由最长匹配合并，如"半月板损伤"算 1 个）
+    from retriever import FitnessRAGRetriever
+    entities = FitnessRAGRetriever._extract_entities(q)
+    injuries = entities.get("injury", [])
 
-    # 2. 无伤病关键词 → 简单问答
-    if not found_keywords:
+    # 2. 无伤病实体 → 简单问答
+    if not injuries:
         return "simple"
 
-    # 3. 检测复合标记词
-    has_compound_marker = any(marker in q for marker in HYDE_COMPOUND_MARKERS)
+    # 3. 部位名是伤病名组成部分时不叠加（"膝关节积液"自带"膝关节"，仍算单伤病）
+    extra_parts = [p for p in entities.get("body_part", [])
+                   if not any(p in i for i in injuries)]
 
-    # 4. 贪心最长匹配去重计数（"腰间盘突出" 算 1 个实体，不是 3 个）
-    sorted_keywords = sorted(found_keywords, key=len, reverse=True)
-    remaining = q
-    entity_count = 0
-    for kw in sorted_keywords:
-        if kw in remaining:
-            entity_count += 1
-            remaining = remaining.replace(kw, "", 1)
+    # 4. 双伤病 / 伤病+独立部位 / 复合标记词 → 复合伤病
+    #    多字标记词要求独立出现（前后非汉字）——"梨状肌综合征"里的"综合"是伤病名
+    #    子串，不是连接标记（"综合征" 的意外命中会把单伤病误判为复合）
+    def _standalone(marker: str) -> bool:
+        idx = q.find(marker)
+        if idx == -1:
+            return False
+        if len(marker) == 1:
+            return True   # 单字连接词（加/和/兼/及…）只要出现即参与
+        prev_ok = idx == 0 or not _HAN_CHAR.match(q[idx - 1])
+        next_ok = idx + len(marker) >= len(q) or not _HAN_CHAR.match(q[idx + len(marker)])
+        return prev_ok and next_ok
 
-    # 5. 实体 ≥2 或 有复合标记 → 复合伤病
-    if entity_count >= 2 or has_compound_marker:
+    has_compound_marker = any(_standalone(m) for m in HYDE_COMPOUND_MARKERS)
+    if len(injuries) >= 2 or (injuries and extra_parts) or has_compound_marker:
         return "compound_injury"
 
     return "single_injury"
+
+
+# ============================================================
+# Multi-turn Query Rewrite — 指代消解（多轮语境下检索前的 query 变换）
+# ============================================================
+
+REWRITE_HINT_WORDS = (
+    "它", "他", "她", "这个", "那个", "该", "此", "刚才", "上面",
+    "以上", "这些", "那些", "呢",
+)
+REWRITE_HISTORY_MAX_TURNS = 6
+
+
+def needs_rewrite(question: str, history_msgs: list) -> bool:
+    """多轮语境下是否需要改写后再检索（纯规则，~0.01ms）。
+
+    历史非空 且（问题含指代词 OR 无任何实体且非计划类问题）→ True。
+    含实体/计划关键词的问题通常自包含（「腰突能深蹲吗」「帮我制定周计划」），无需改写。
+    """
+    if not history_msgs:
+        return False
+    if any(w in question for w in REWRITE_HINT_WORDS):
+        return True
+    from retriever import FitnessRAGRetriever
+    entities = FitnessRAGRetriever._extract_entities(question)
+    if any(v for v in entities.values()):
+        return False
+    if any(kw in question for kw in ("计划", "方案", "每周", "安排", "周期", "定制")):
+        return False
+    return True
+
+
+def _history_text(history_msgs: list, max_turns: int = REWRITE_HISTORY_MAX_TURNS) -> str:
+    """最近几轮历史 → "user: ...\nassistant: ..." 文本（dict 与 BaseMessage 兼容）。"""
+    rows = []
+    for m in history_msgs[-max_turns:]:
+        if isinstance(m, dict):
+            role = {"human": "user", "ai": "assistant"}.get(
+                m.get("type") or m.get("role"), "user")
+            content = m.get("content", "") or ""
+        else:
+            role = {"human": "user", "ai": "assistant"}.get(getattr(m, "type", ""), "user")
+            content = getattr(m, "content", "") or ""
+        rows.append(f"{role}: {content}")
+    return "\n".join(rows)
+
+
+REWRITE_PROMPT = (
+    "你是对话查询改写助手。根据对话历史，把用户最新问题改写成一个可独立检索的"
+    "完整中文问题（补充指代对象与省略内容，如「那硬拉呢」→「腰突患者可以做硬拉吗」）。\n"
+    "只输出改写后的问句本身：不要回答原问题，不要加引号，不要任何解释。\n\n"
+    "对话历史：\n{history}\n\n最新问题：{question}"
+)
+
+
+def rewrite_query(question: str, history_msgs: list, llm) -> str:
+    """LLM 改写查询；异常 / 空输出 / 超长 → 回退原问题（检索质量兜底）。
+
+    复用 "hyde" 角色小模型（qwen2.5:0.5b / qwen3.7-flash，max_tokens=64）。
+    模式沿用 generate_hypothetical_doc 的「模板 + invoke + 回退」三件套。
+    """
+    try:
+        prompt_text = REWRITE_PROMPT.format(
+            history=_history_text(history_msgs), question=question)
+        response = llm.invoke([{"role": "user", "content": prompt_text}], max_tokens=64)
+        content = response.content if hasattr(response, "content") else str(response)
+        out = (content or "").strip().strip('"').strip("'").strip()
+        if not out or len(out) > 200:
+            return question
+        return out
+    except Exception:
+        return question
 
 
 # ============================================================

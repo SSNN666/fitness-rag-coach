@@ -121,7 +121,14 @@ def _estimate_tokens(text: str) -> int:
 # ============================================================
 
 class _StructuredLogger:
-    """JSON Lines 日志 → 文件，RotatingFileHandler 5MB × 3 备份。"""
+    """JSON Lines 日志 → 文件，RotatingFileHandler 5MB × 3 备份。
+
+    llm_adapter / content_moderation 等底层模块的日志共用同一文件句柄
+    （同一 handler 实例 → 共享轮转锁），不再散落控制台明文。
+    """
+
+    # 并入 gateway.log JSON 的底层模块 logger 名
+    EXTRA_JSON_LOGGERS = ("llm_adapter", "content_moderation")
 
     def __init__(self, path: str, level: str = "INFO"):
         self._logger = logging.getLogger("gateway")
@@ -134,6 +141,13 @@ class _StructuredLogger:
         fh.setFormatter(_JsonFormatter())
         fh.setLevel(getattr(logging, level.upper(), logging.INFO))
         self._logger.addHandler(fh)
+
+        for name in self.EXTRA_JSON_LOGGERS:
+            lg = logging.getLogger(name)
+            lg.handlers.clear()
+            lg.setLevel(logging.DEBUG)
+            lg.addHandler(fh)
+            lg.propagate = False   # 不再冒泡到 root(避免控制台明文重复输出)
 
     def log(self, level: str, event: str, **kwargs):
         """写入一条结构化日志。"""

@@ -38,7 +38,8 @@ from config import *
 from crag_search import build_search_query, format_search_results, search_fitness, crag_retrieve
 from gateway import Gateway, GatewayConfig
 from grounding import assess_grounding, refusal_message
-from hyde import generate_hyde_drafts, hyde_retrieve
+from health_tools import run_health_tools
+from hyde import generate_hyde_drafts, hyde_retrieve, needs_rewrite, rewrite_query
 from llm_adapter import FallbackChain, build_embeddings, build_llm, to_runnable
 from retriever import FitnessRAGRetriever, load_bm25_from_pickle
 
@@ -146,7 +147,8 @@ class PipelineService:
                user_profile: str | None = None,
                request_id: str | None = None,
                deep_thinking: bool = False,
-               on_stage=None) -> PipelineResult:
+               on_stage=None, on_delta=None,
+               stop_event: threading.Event | None = None) -> PipelineResult:
         """完整流水线（非流式）。SSE 缓冲模式与 /v1/chat 共用此入口。
 
         五阶段线程模型（锁内只做共享状态/Milvus 操作，LLM/网络全部锁外并行）：
@@ -158,6 +160,8 @@ class PipelineService:
           F（锁外） 生成 → 硬过滤 → Fact-Check → 引用 →（回锁）写历史
 
         on_stage: 阶段进度回调（SSE status 帧数据源）；None = 不播报
+        on_delta: token 级增量回调（真流式 SSE 数据源）；None = 非流式生成
+        stop_event: 客户端断开取消信号；置位时流水线在阶段边界及时退出（SSE 断开保护）
         """
         rid = request_id or uuid.uuid4().hex[:12]
         result = PipelineResult(request_id=rid)
@@ -201,38 +205,80 @@ class PipelineService:
                 tier_cfg["role"] = "chat"
                 tier_cfg["max_tokens"] = {"injury": 2048, "plan": 3072}.get(tier, 2048)
 
-        self._stage(on_stage, "已完成安全分析，正在检索知识库…")
+            # 多轮查询改写标记：指代消解后检索（「那硬拉呢」需要上一轮「腰突」上下文）。
+            # 历史快照在锁内读取，改写本身放锁外（云端 LLM 调用）
+            history_snapshot: list = []
+            do_rewrite = False
+            if REWRITE_ENABLED:
+                history_snapshot = self._history_messages(session_id)
+                do_rewrite = needs_rewrite(question, history_snapshot)
 
-        # ===== 阶段 B（锁外）：HyDE 草稿生成（云端 LLM，无共享状态；复合伤病三路并行）=====
+        self._stage(on_stage, "已完成安全分析，正在检索知识库…")
+        if self._cancelled(stop_event):
+            return result
+
+        # ===== 阶段 B（锁外）：查询改写 + HyDE 草稿生成（云端 LLM，无共享状态）=====
+        # 多轮改写先行：改写后的 retrieval_q 仅用于检索（Phase C）；
+        # 原 question 仍用于 Prompt / 分层判定 / FactCache key
+        retrieval_q = question
+        if do_rewrite:
+            retrieval_q = rewrite_query(question, history_snapshot, self._llms["hyde"])
+        # simple 层跳过 HyDE 直查（HYDE_SKIP_SIMPLE）：基础问答直查已满分，省 1 次 LLM 调用
         drafts = None
-        if HYDE_ENABLED:
+        if HYDE_ENABLED and not (tier == "simple" and HYDE_SKIP_SIMPLE):
             try:
-                drafts = generate_hyde_drafts(question, self._llms["hyde"])
+                drafts = generate_hyde_drafts(retrieval_q, self._llms["hyde"])
             except Exception as e:
                 drafts = None
                 self._gateway.log_cycle("error", request_id=rid, event_detail="hyde_gen_error",
                                         error=str(e)[:200])
+        if self._cancelled(stop_event):
+            return result
 
         # ===== 阶段 C（锁内）：检索（Milvus Lite 非线程安全；重排候选池留给锁外）=====
-        with self._lock:
+        # 检索侧 OOM 防线:可用内存过低 → 降级为 BM25-only(稀疏索引内存占用极小)
+        if RETRIEVAL_MEMORY_GUARD_ENABLED:
             try:
+                from config import get_available_memory_gb
+                avail = get_available_memory_gb()
+                low = avail < RETRIEVAL_MEMORY_THRESHOLD_GB
+                self._retriever.set_degraded(low)
+                if low:
+                    self._gateway.log_cycle("warning", request_id=rid,
+                                            event_detail="retrieval_degraded_sparse_only",
+                                            avail_gb=round(avail, 2))
+            except Exception:
+                pass   # 内存检测失败不影响主链路
+        with self._lock:
+            q_emb = None
+            try:
+                # 注：hyde_retrieve 必须先于 search_with_scores——其内部检索会把
+                # _last_query_embedding 覆盖为草稿向量，后者的 search 才写回 query 向量
                 if drafts:
                     ctx, cite_docs = hyde_retrieve(
-                        question, self._llms["hyde"], self._retriever,
+                        retrieval_q, self._llms["hyde"], self._retriever,
                         top_k=tier_cfg.get("retrieve_k"), drafts=drafts)
-                else:
-                    cite_docs = self._retriever.invoke(question)
-                    ctx = self._format_docs(cite_docs)
                 # 重排层取候选池（RERANKER_MAX_CANDIDATES）；simple 层直接收窄到 context_docs
                 retr_k = RERANKER_MAX_CANDIDATES if tier_cfg["rerank"] \
                     else tier_cfg.get("context_docs", CONTEXT_DOCS_MAX)
                 scored_docs = self._retriever.search_with_scores(
-                    question, k=retr_k, use_rerank=False)
+                    retrieval_q, k=retr_k, use_rerank=False)
+                if not drafts:
+                    # 直查路径：search_with_scores 结果即引用来源（simple 层跳过 HyDE 后
+                    # 不再单独 invoke 重复检索——原实现同 query 同 k 搜了两次）
+                    cite_docs = [d for d, _ in scored_docs]
+                    ctx = self._format_docs(cite_docs)
+                # 锁内读取 query 向量缓存：grounding 相关性判定复用，免重复 embedding
+                # （搜索成功后该属性必为本查询向量；锁外读取会被并发检索覆盖，故在锁内取）
+                q_emb = self._retriever._last_query_embedding
             except Exception as e:
-                ctx, cite_docs, scored_docs = "", [], []
+                ctx, cite_docs, scored_docs, q_emb = "", [], [], None
                 self._gateway.log_cycle("error", request_id=rid, event_detail="retrieval_error",
                                         error=str(e)[:200])
-            self._gateway.log_retrieval(rid, question, self._docs_to_log(scored_docs))
+            # 记录实际检索用 query（改写场景可审计原始 vs 改写后）
+            self._gateway.log_retrieval(rid, retrieval_q, self._docs_to_log(scored_docs))
+        if self._cancelled(stop_event):
+            return result
 
         self._stage(on_stage, "检索完成，正在校验回答依据…")
 
@@ -264,12 +310,14 @@ class PipelineService:
         if scored_docs:
             try:
                 import numpy as np
-                q_emb = np.array(self._retriever._embed(question))
+                if q_emb is None:
+                    q_emb = self._retriever._embed(question)   # 稀疏检索降级路径：向量未算过
+                q_vec = np.array(q_emb)
                 sims = []
                 for d, _ in scored_docs[:3]:
                     d_emb = np.array(self._retriever._embed(d.page_content))
-                    sims.append(float(np.dot(q_emb, d_emb) /
-                                      (np.linalg.norm(q_emb) * np.linalg.norm(d_emb) + 1e-9)))
+                    sims.append(float(np.dot(q_vec, d_emb) /
+                                      (np.linalg.norm(q_vec) * np.linalg.norm(d_emb) + 1e-9)))
                 relevance = max(sims)
             except Exception:
                 relevance = None
@@ -284,9 +332,25 @@ class PipelineService:
                                     relevance=round(relevance, 3) if relevance else None,
                                     n_docs=verdict.n_docs, ctx_chars=verdict.ctx_chars)
             return result
+        # REFUSE_ENABLED=False:不拒答 → 生成"通用知识 + 免责声明"(grounded 标记保留)
+        unfounded = not verdict.grounded
+        if self._cancelled(stop_event):
+            return result
 
         # ===== 阶段 E（锁内）：Prompt 组装 + 令牌预算（裁剪 store）+ 缓存快速路径 =====
         with self._lock:
+            # 确定性健康工具：参数齐全且关键词命中 → 结果注入上下文顶部
+            # （位于令牌预算守卫之前：头部位置不会被尾部截断误伤；纯本地 ~0.1ms）
+            tool_results: list = []
+            if HEALTH_TOOLS_ENABLED:
+                try:
+                    tool_results = run_health_tools(question, user_profile)
+                except Exception:
+                    tool_results = []
+                if tool_results:
+                    tool_ctx = "\n".join(f"- [{t.title}] {t.content}" for t in tool_results)
+                    ctx = f"[工具计算结果]\n{tool_ctx}\n\n{ctx}"
+
             system_prompt = self._select_prompt(question)
             if contra_text and "暂无" not in contra_text and "无需" not in contra_text:
                 ctx = contra_text + "\n" + ctx
@@ -297,10 +361,12 @@ class PipelineService:
             # 缓存快速路径：同问题同模式已校验过的回答直接复用（跳过生成，省 LLM 调用）
             if self._needs_fact_check(question) and self._fact_cache is not None:
                 cached = self._fact_cache.get(
-                    question, self._cache_key_entities(question, deep_thinking))
+                    question, self._cache_key_entities(question, deep_thinking,
+                                                       tool_results, user_profile))
                 if cached:
                     cached += self._mode_hint(tier, deep_thinking)
-                    result.citations = self._build_citations(cite_docs, crag_raw, entities)
+                    result.citations = self._build_citations(
+                        cite_docs, crag_raw, entities, tool_results)
                     result.answer = cached
                     self._append_history(session_id, question, cached)
                     self._gateway.log_answer(rid, cached)
@@ -344,7 +410,9 @@ class PipelineService:
             tier=tier, deep_thinking=deep_thinking,
             base_llm=base_llm, chat_llm=chat_llm, messages=messages,
             cite_docs=cite_docs, entities=entities, crag_raw=crag_raw,
-            on_stage=on_stage,
+            tool_results=tool_results,
+            on_stage=on_stage, on_delta=on_delta,
+            unfounded=unfounded, stop_event=stop_event,
         )
         return self._generate(gen, rid, result)
 
@@ -369,16 +437,45 @@ class PipelineService:
 
         # ---- Step 9: 降级链生成（云 → 本地）----
         self._stage(gen.get("on_stage"), "正在生成回答…")
-        resp = chat_llm.invoke(messages, max_tokens=tier_cfg.get("max_tokens"),
-                               request_id=rid)
-        answer = resp.content
-        # fallback_active 覆盖两类降级：供应商降级链 + 内存守卫切小模型
-        result.fallback_active = resp.fallback or (chat_llm is not base_llm)
-        if resp.usage:
-            result.usage.append(resp.usage)
-            self._gateway.log_usage(rid, "chat", resp.usage)
-        if resp.error_kind:
-            result.error = resp.error_kind
+        on_delta = gen.get("on_delta")
+        if on_delta is not None:
+            # 真流式:stream_events 逐 token 回调 + 末块 usage(流中降级标记随文本透出)
+            parts: list[str] = []
+            last_usage = None
+            fb_switch = False
+            for ev in chat_llm.stream_events(messages, max_tokens=tier_cfg.get("max_tokens"),
+                                             request_id=rid):
+                if self._cancelled(gen.get("stop_event")):
+                    break   # 客户端断开：及时退出 LLM 流式循环
+                if ev.text:
+                    parts.append(ev.text)
+                    on_delta(ev.text)
+                if ev.usage:
+                    last_usage = ev.usage
+                if ev.fallback_switch:
+                    fb_switch = True
+            answer = "".join(parts)
+            # fallback_active 覆盖三类降级:供应商降级链 + 内存守卫切小模型 + 流中切换
+            result.fallback_active = fb_switch or (chat_llm is not base_llm)
+            if last_usage is not None:
+                result.usage.append(last_usage)
+                self._gateway.log_usage(rid, "chat", last_usage)
+        else:
+            resp = chat_llm.invoke(messages, max_tokens=tier_cfg.get("max_tokens"),
+                                   request_id=rid)
+            answer = resp.content
+            # fallback_active 覆盖两类降级：供应商降级链 + 内存守卫切小模型
+            result.fallback_active = resp.fallback or (chat_llm is not base_llm)
+            if resp.usage:
+                result.usage.append(resp.usage)
+                self._gateway.log_usage(rid, "chat", resp.usage)
+            if resp.error_kind:
+                result.error = resp.error_kind
+
+        # 客户端断开（stop_event 置位）：丢弃部分结果，跳过重试/校验/历史写回
+        if self._cancelled(gen.get("stop_event")):
+            result.answer = answer   # 保留已生成的部分内容（SSE 侧已断开，仅占位不展示）
+            return result
 
         # 回答长度守卫：快速模式（关思考）偶发退化输出（实测 12 token）→ 重生成一次。
         # 重试用 chat_nothink（思考模式重试实测 37s，感知太慢）；再次退化由 💡 深度思考兜底
@@ -404,14 +501,21 @@ class PipelineService:
         if self._needs_fact_check(question):
             answer = self._run_fact_check(question, answer, ctx, contra_text, forbidden,
                                           deep_thinking=gen.get("deep_thinking", False),
+                                          tool_results=gen.get("tool_results"),
                                           request_id=rid)
 
         # 复杂层快速模式答后提示（用户可开深度思考重问；simple 层不提示）
         answer += self._mode_hint(gen.get("tier", ""), gen.get("deep_thinking", False))
 
+        # 无依据生成分支（REFUSE_ENABLED=False）:附加免责声明
+        if gen.get("unfounded"):
+            answer += UNFOUNDED_DISCLAIMER
+            result.grounded = False
+
         # ---- Step 12: 结构化引用 ----
         result.citations = self._build_citations(gen["cite_docs"], gen["crag_raw"],
-                                                 gen["entities"])
+                                                 gen["entities"],
+                                                 gen.get("tool_results"))
         result.answer = answer
 
         # 会话历史写回（重新获取锁；注入检测等阻断路径不写）
@@ -425,6 +529,11 @@ class PipelineService:
         """阶段进度回调（SSE status 帧数据源）；on_stage 为 None 时静默跳过。"""
         if on_stage:
             on_stage(name)
+
+    @staticmethod
+    def _cancelled(stop_event) -> bool:
+        """SSE 断开取消信号：置位时流水线在阶段边界及时退出（见 answer 的 stop_event 参数）。"""
+        return stop_event is not None and stop_event.is_set()
 
     def _select_prompt(self, query: str) -> str:
         entities = FitnessRAGRetriever._extract_entities(query)
@@ -588,23 +697,34 @@ class PipelineService:
         return ""
 
     @staticmethod
-    def _cache_key_entities(question: str, deep_thinking: bool = False) -> list[str]:
-        """缓存 key 的实体部分：实体名 + 模式标签 + 提示词版本（同问题不同模式不共享缓存）。"""
+    def _cache_key_entities(question: str, deep_thinking: bool = False,
+                            tool_results: list | None = None,
+                            user_profile: str | None = None) -> list[str]:
+        """缓存 key 的实体部分：实体名 + 模式标签 + 提示词版本（同问题不同模式不共享缓存）。
+
+        tool_results 非空时追加画像指纹：同问题不同画像的工具答案不同
+        （「帮我算下BMI」在身高170/体重70 与 180/80 下结果不同），不能复用旧缓存。
+        """
         names = [n for names in FitnessRAGRetriever._extract_entities(question).values()
                  for n in names]
         names.append(f"mode:{'deep' if deep_thinking else 'fast'}")
         names.append(f"pv:{FACT_CACHE_VERSION}")   # 改提示词后 bump config.FACT_CACHE_VERSION
+        if tool_results and user_profile:
+            import hashlib
+            names.append(f"profile:{hashlib.md5(user_profile.encode('utf-8')).hexdigest()[:8]}")
         return names
 
     def _run_fact_check(self, question: str, answer: str, context: str,
                         contraindications: str, forbidden_actions: list[str],
                         deep_thinking: bool = False,
+                        tool_results: list | None = None,
                         request_id: str | None = None) -> str:
         """事实校验：缓存 → 小模型四类校验 → 失败走 CRAG 修正。任何环节异常不阻断。"""
         # 1. 查缓存（key 含模式维度；生成前已有快速路径，此处兜底）
         if self._fact_cache is not None:
             cached = self._fact_cache.get(
-                question, self._cache_key_entities(question, deep_thinking))
+                question, self._cache_key_entities(question, deep_thinking,
+                                                   tool_results))
             if cached:
                 return cached
 
@@ -615,7 +735,8 @@ class PipelineService:
         if result.passed:
             if self._fact_cache is not None:
                 self._fact_cache.set(
-                    question, answer, self._cache_key_entities(question, deep_thinking))
+                    question, answer, self._cache_key_entities(question, deep_thinking,
+                                                               tool_results))
             return answer
 
         # 3. 校验失败 → CRAG 联网修正（降级链生成）
@@ -645,7 +766,8 @@ class PipelineService:
         # 4. 缓存修正后的回答
         if self._fact_cache is not None:
             self._fact_cache.set(
-                question, answer, self._cache_key_entities(question, deep_thinking))
+                question, answer, self._cache_key_entities(question, deep_thinking,
+                                                           tool_results))
         return answer
 
     _SENT_END = re.compile(r"[。！？；!?;]")
@@ -678,9 +800,12 @@ class PipelineService:
         return t
 
     @staticmethod
-    def _build_citations(cite_docs: list, crag_raw: list, entities: dict) -> list:
-        """结构化引用：联网优先 → 图谱 → 本地KB。与回答正文分离。"""
+    def _build_citations(cite_docs: list, crag_raw: list, entities: dict,
+                         tool_results: list | None = None) -> list:
+        """结构化引用：工具优先 → 联网 → 图谱 → 本地KB。与回答正文分离。"""
         citations = []
+        for t in (tool_results or []):
+            citations.append({"kind": "tool", "source": t.title, "snippet": t.content})
         for r in crag_raw[:3]:
             citations.append({
                 "kind": "web",
@@ -847,8 +972,11 @@ def build_pipeline() -> PipelineService:
 
     llms = {
         "chat": build_llm("chat"),
-        "chat_nothink": build_llm("chat_nothink", on_usage=_bg_usage),  # 复杂层默认快速（plus 关思考）
-        "chat_fast": build_llm("chat_fast", on_usage=_bg_usage),        # 分层策略：simple 查询快模型
+        # 主链角色（chat_nothink/chat_fast）的 usage 由 pipeline 按 request_id 记一次日志；
+        # 若挂 on_usage 会在 FallbackChain 内以 request_id=background 再记一条 → 双记。
+        # 后台角色（hyde/rerank/fact_check）无请求上下文，统一记 request_id=background。
+        "chat_nothink": build_llm("chat_nothink"),                      # 复杂层默认快速（plus 关思考）
+        "chat_fast": build_llm("chat_fast"),                            # 分层策略：simple 查询快模型
         "hyde": build_llm("hyde", on_usage=_bg_usage),
     }
 

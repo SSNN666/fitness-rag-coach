@@ -88,6 +88,62 @@ class FitnessRAGRetriever:
             import config as _cfg
             fusion_mode = getattr(_cfg, "FUSION_MODE", "weighted")
         self._fusion_mode = fusion_mode
+        # 语义去重开关（默认关：开启会对全部候选两两余弦 + N 次 embedding，费时费钱）
+        import config as _cfg
+        self._semantic_dedup_enabled = getattr(_cfg, "FUSION_SEMANTIC_DEDUP_ENABLED", False)
+        # 父块回取:子块命中后按 parent_id 聚合回父块(完整上下文),parents.json 由建库脚本写入
+        self._parents: dict = self._load_parent_store()
+        # 检索降级:可用内存过低时跳过 Milvus/图谱,仅走 BM25(检索侧 OOM 防线)
+        self._retrieval_degraded = False
+        # 最近一次 query 向量缓存（search_with_scores 内锁下写入；供 grounding 相关性判定复用，
+        # 免每次请求重复 embedding。锁外读取方需自行保证时序——pipeline 在锁内读取）
+        self._last_query_embedding: list | None = None
+
+    # ================================================================
+    # 父块回取 / 检索降级
+    # ================================================================
+
+    _PARENT_MAX_CHARS = 5000   # 父块注入上限(令牌预算守卫会再做句子级裁剪)
+
+    def _load_parent_store(self) -> dict:
+        """加载 parents.json({parent_id: {page_content, metadata}});缺失/损坏 → 空 dict(降级为子块直出)。"""
+        import os as _os
+        path = _os.path.join("milvus_data", "parents.json")
+        try:
+            with open(path, encoding="utf-8") as f:
+                return json.load(f)
+        except Exception:
+            return {}
+
+    def _expand_to_parents(self, docs: list[tuple[Document, float]]) -> list[tuple[Document, float]]:
+        """子块 → 父块聚合:命中子块按 parent_id 取父块全文,同父块多子块去重。"""
+        if not self._parents or not docs:
+            return docs
+        out: list[tuple[Document, float]] = []
+        seen: set = set()
+        for doc, score in docs:
+            pid = doc.metadata.get("parent_id", "")
+            parent = self._parents.get(pid)
+            if not parent:
+                out.append((doc, score))
+                continue
+            if pid in seen:
+                continue   # 同一父块的多个子块 → 只保留首个(取最高得分)
+            seen.add(pid)
+            meta = dict(doc.metadata)
+            meta.update(parent.get("metadata") or {})
+            meta["parent_id"] = pid
+            meta["child_source"] = doc.metadata.get("source", "")
+            parent_doc = Document(
+                page_content=str(parent.get("page_content", ""))[:self._PARENT_MAX_CHARS],
+                metadata=meta,
+            )
+            out.append((parent_doc, score))
+        return out
+
+    def set_degraded(self, degraded: bool) -> None:
+        """检索降级开关:True = 仅 BM25 稀疏检索(Milvus/图谱跳过)。"""
+        self._retrieval_degraded = degraded
 
     # ================================================================
     # 对外接口
@@ -149,9 +205,17 @@ class FitnessRAGRetriever:
             [(Document, final_score), ...] 按得分降序
         """
         # 三路独立检索（使用可配置的扩大倍数，给 reranker 更多候选）
-        milvus_results = self._search_milvus(query, k * self.milvus_factor)
+        # 检索降级:低内存时跳过 Milvus/图谱,仅 BM25(稀疏索引内存占用极小)
+        if self._retrieval_degraded:
+            milvus_results, neo4j_results = [], []
+            self._last_query_embedding = None   # 稀疏模式不计算向量
+        else:
+            # query 向量只嵌入一次：检索 + grounding 相关性判定复用（见 _last_query_embedding 注释）
+            query_vec = self._embed(query)
+            self._last_query_embedding = query_vec
+            milvus_results = self._search_milvus_with_vec(query_vec, k * self.milvus_factor)
+            neo4j_results = self._search_neo4j(query, k * self.neo4j_factor)
         bm25_results = self._search_bm25(query, k * self.bm25_factor)
-        neo4j_results = self._search_neo4j(query, k * self.neo4j_factor)
 
         path_results = [milvus_results, bm25_results, neo4j_results]
 
@@ -175,6 +239,8 @@ class FitnessRAGRetriever:
         if use_rerank and self._reranker is not None and len(merged) > k:
             merged = self._reranker.rerank(query, merged, top_k=k)
 
+        # 父块回取:子块命中 → 聚合为父块全文(同父块去重)
+        merged = self._expand_to_parents(merged)
         return merged[:k]
 
     # ----------------------------------------------------------------
@@ -225,6 +291,10 @@ class FitnessRAGRetriever:
             [(Document, cosine_score), ...]  cosine_score ∈ [0, 1]
         """
         vec = self._embed(query)
+        return self._search_milvus_with_vec(vec, k)
+
+    def _search_milvus_with_vec(self, vec: list[float], k: int) -> list[tuple[Document, float]]:
+        """向量检索（复用已计算的 query 向量，search_with_scores 传参免重复 embedding）。"""
         results = self._milvus.search(
             collection_name=MILVUS_COLLECTION,
             data=[vec],
@@ -382,11 +452,15 @@ class FitnessRAGRetriever:
         if not entities:
             return []
 
-        # 判断是否需要多跳：≥2 个伤病 或 伤病+身体部位 或 复合标记触发
+        # 判断是否需要多跳：≥2 个伤病 或 伤病+独立身体部位 或 复合标记触发
+        # 部位名是伤病名的组成部分时不叠加（"膝关节积液"自带"膝关节"，单伤病 1-hop）
         from hyde import classify_query
+        injuries = entities.get("injury", [])
+        extra_parts = [p for p in entities.get("body_part", [])
+                       if not any(p in i for i in injuries)]
         has_compound = (
-            len(entities.get("injury", [])) >= 2
-            or (entities.get("injury") and entities.get("body_part"))
+            len(injuries) >= 2
+            or (injuries and extra_parts)
             or classify_query(query) == "compound_injury"
         )
         depth = self.neo4j_max_depth if has_compound else self.neo4j_depth
@@ -401,11 +475,31 @@ class FitnessRAGRetriever:
     # ----------------------------------------------------------------
 
     _RELATION_SCORE = {
-        # 关系类型 → 分数（禁忌/康复信号 > 普通关联）
+        # 关系标签 → 分数（禁忌/康复信号 > 普通关联）
         "禁忌动作": 1.0,
         "康复动作": 0.9,
         "谨慎动作": 0.7,
     }
+
+    @staticmethod
+    def _relation_label(relation: str, desc: str) -> str:
+        """从关系类型名或描述中提取完整标签（禁忌动作/康复动作/谨慎动作）。
+
+        图谱数据源两种落点都兼容：标签在关系类型（type(r)）或描述（r.description）。
+        查不到时返回原始描述（默认分数 0.5 语义）。
+        """
+        for lbl in ("禁忌动作", "康复动作", "谨慎动作"):
+            if lbl in (relation or "") or lbl in (desc or ""):
+                return lbl
+        return desc or relation
+
+    @staticmethod
+    def _score_relation(label: str) -> float:
+        """关系标签 → 分数（禁忌 1.0 > 康复 0.9 > 谨慎 0.7 > 默认 0.5）。"""
+        for k, s in FitnessRAGRetriever._RELATION_SCORE.items():
+            if k in (label or ""):
+                return s
+        return 0.5  # 默认分数
 
     def _neo4j_one_hop(self, entities: dict, k: int) -> list[tuple[Document, float]]:
         """MATCH (e)-[r]->(n) WHERE e.name IN $names，按关系类型差异化评分。"""
@@ -431,28 +525,25 @@ class FitnessRAGRetriever:
 
         out = []
         for rec in records:
+            rel_label = self._relation_label(rec.get("relation", ""), rec.get("rel_desc", ""))
             text = (
                 f"[图谱] {rec['src']}({rec['src_type']}) "
-                f"--[{rec['relation']}]--> {rec['target']}({rec['target_type']})"
+                f"--[{rel_label}]--> {rec['target']}({rec['target_type']})"
             )
             rel_desc = rec.get("rel_desc", "")
             if rel_desc:
                 text += f": {rel_desc}"
 
-            # 按关系类型评分（禁忌 > 康复 > 谨慎 > 其他默认 0.5）
-            score = self._score_relation(rel_desc)
+            # 按关系标签评分（禁忌 > 康复 > 谨慎 > 其他默认 0.5）
+            score = self._score_relation(rel_label)
             labels = [f"{rec['src_type']}:{rec['src']}", f"{rec['target_type']}:{rec['target']}"]
-            doc = Document(page_content=text, metadata={"source": "neo4j", "hops": 1, "entity_labels": labels})
+            # relation 元数据供 _merge_conflicts 检测矛盾标注（禁忌 vs 康复）
+            doc = Document(page_content=text, metadata={"source": "neo4j", "hops": 1,
+                                                        "entity_labels": labels,
+                                                        "relation": rel_label})
             out.append((doc, score))
+        out.sort(key=lambda x: x[1], reverse=True)   # 先排序再截断（调用方 fusion 前就取 top-k）
         return out
-
-    @staticmethod
-    def _score_relation(desc: str) -> float:
-        """从关系描述中提取关系标签并映射到分数。"""
-        for label, s in FitnessRAGRetriever._RELATION_SCORE.items():
-            if label in (desc or ""):
-                return s
-        return 0.5  # 默认分数
 
     # ----------------------------------------------------------------
     # 多跳查询（核心新增）
@@ -509,35 +600,52 @@ class FitnessRAGRetriever:
             if desc_text:
                 text += f": {desc_text}"
 
-            # 评分：深度越浅越高；含禁忌关系 boost
-            base_score = 1.0 / hops
-            has_contraind = any("禁忌" in (d or "") for d in rel_descs)
+            # 评分：关系标签基础分（禁忌1.0/康复0.9/谨慎0.7/默认0.5）× 深度衰减（hop 越浅越高）；
+            # 含禁忌关系路径额外 boost（类型名/描述双源匹配）
+            relations = rec.get("relations", []) or []
+            # 末段关系即指向目标动作的关系（供 _merge_conflicts 冲突检测；标签归一）
+            rel_label = self._relation_label(
+                relations[-1] if relations else "", rel_descs[-1] if rel_descs else "")
+            tag_score = self._RELATION_SCORE.get(rel_label, 0.5)
+            base_score = tag_score / hops
+            has_contraind = any("禁忌" in (d or "") for d in rel_descs) or \
+                any("禁忌" in (r or "") for r in relations)
             if has_contraind:
                 base_score = min(1.0, base_score * NEO4J_PATH_BOOST_CONTRAIND)
 
             labels = [f"{rec['node_types'][0]}:{rec['path_nodes'][0]}" if rec.get("node_types") and rec.get("path_nodes") else f"injury:{rec['src']}"]
-            doc = Document(page_content=text, metadata={"source": "neo4j", "hops": hops, "entity_labels": labels})
+            doc = Document(page_content=text, metadata={"source": "neo4j", "hops": hops,
+                                                        "entity_labels": labels,
+                                                        "relation": rel_label})
             results.append((doc, base_score))
 
-        return self._merge_conflicts(results)[:k]
+        merged = self._merge_conflicts(results)
+        merged.sort(key=lambda x: x[1], reverse=True)   # 先排序再截断（否则高分路径被挤出 top-k）
+        return merged[:k]
 
     @staticmethod
     def _merge_conflicts(results: list) -> list:
-        """检测路径冲突：同一目标动作被标记为禁忌+康复时同时保留并标注。"""
+        """检测路径冲突：同一目标动作被标记为禁忌+康复时同时保留并标注。
+
+        关系标签归一后再比较（禁忌/康复/谨慎），避免同类别描述差异（如
+        "禁忌动作: 深蹲压迫半月板" vs "禁忌动作: 深蹲挤压椎间盘"）误报冲突。
+        """
         seen = {}
         merged = []
         for doc, score in results:
             # 提取路径末端动作名作为去重键
             path_parts = doc.page_content.split(" → ")
             key = path_parts[-1].split(":")[0].strip() if path_parts else ""
+            rel = doc.metadata.get("relation", "")
+            rel_label = next((lbl for lbl in ("禁忌", "康复", "谨慎") if lbl in rel), rel)
             if key and key in seen:
                 prev_doc, _ = seen[key]
-                prev_rel = prev_doc.metadata.get("relation", "")
-                cur_rel = doc.metadata.get("relation", "")
-                if prev_rel and cur_rel and prev_rel != cur_rel:
+                prev_label = prev_doc.metadata.get("_rel_label", "")
+                if prev_label and rel_label and prev_label != rel_label:
                     doc.page_content += "\n[冲突] 该动作在不同路径中有矛盾标注，请结合医嘱评估"
             if key:
                 seen[key] = (doc, score)
+                doc.metadata["_rel_label"] = rel_label
             merged.append((doc, score))
         return merged
 
@@ -580,7 +688,7 @@ class FitnessRAGRetriever:
     ) -> list[tuple[Document, float]]:
         """
         实体匹配 boost：query 抽取实体（exercise/muscle/equipment/injury/body_part），
-        与每条文档的 entity_labels 取交集。有交集 → boost ×1.2，无交集 → penalize ×0.6。
+        与每条文档的 entity_labels 取交集。有交集 → ×1.5，无交集 → ×0.85。
         query 无实体时跳过（普通问答不分类型过滤）。
         """
         q_entities = set()
@@ -652,8 +760,9 @@ class FitnessRAGRetriever:
             if score >= self.threshold
         ]
 
-        # 语义去重（如启用）
-        if len(merged) > 1:
+        # 语义去重（FUSION_SEMANTIC_DEDUP_ENABLED 默认关——开启会对全部候选做
+        # N 次 embedding + 两两余弦，候选池大时费时费钱；配置开关需重建索引语义）
+        if self._semantic_dedup_enabled and len(merged) > 1:
             merged = self._semantic_dedup(merged)
 
         merged.sort(key=lambda x: x[1], reverse=True)

@@ -4,15 +4,20 @@
 
 ## ✨ 核心特性
 
-- **统一大模型适配器**：主链路阿里云百炼 DashScope（MaaS 部署 qwen3.7-plus，`DASHSCOPE_BASE_URL` 可切公共云/私有化），千帆 ERNIE 可选，本地 Ollama 兜底；超时/429 限流/额度不足/上下文超长自动分类 → 重试退避 → 降级链
+- **统一大模型适配器**：主链路阿里云百炼 DashScope（MaaS 部署 qwen3.7-plus，`DASHSCOPE_BASE_URL` 可切公共云/私有化），DeepSeek / 千帆 ERNIE 可选，本地 Ollama 兜底；超时/429 限流（按 Retry-After 退避）/额度不足/上下文超长自动分类 → 重试退避 → 降级链
 - **分层生成策略**：按查询复杂度分配模型与预算——简单问题快模型+短预算+跳过重排（约 8s），伤病/计划问题主模型+思考模式+校验（约 35s）；混合思考开关按角色配置（短回答类任务关思考提速 17 倍）
 - **双路检索 + 图谱可插拔**：Milvus Lite 语义向量 + BM25 关键词，RRF / 加权融合双模式可切换；Neo4j 伤病禁忌图谱默认停用、config 一键切回三路
 - **安全流水线（12 步）**：实体抽取 → 禁忌黑名单 → 边界拒绝 → HyDE 检索 → CRAG 补盲 → **拒答判定** → 分层 Prompt → 令牌预算 → 降级链生成 → 硬性过滤 → Fact-Check → 结构化引用
 - **禁忌数据双源降级**：Neo4j 图谱停机时自动切 [contra_data.py](contra_data.py) 本地副本（28 类伤病禁忌，与图谱构建共用单一数据源）——核心安全数据不依赖单一外部服务
 - **接口层防护**：X-API-Key 鉴权（演示级）、Prompt 注入检测（规则加权）、百度内容审核（输入/输出双向，fail-open）
 - **完整日志**：query / 检索片段 / prompt / 模型输出 / 报错 / token 消耗（JSON Lines，轮转）
-- **SSE 流式**：缓冲模式（审核先于展示）+ 引用/降级/token 元信息帧
+- **SSE 真流式**：token 级 delta 实时透出（降级链 stream_events，流中降级标记随文显示）+ 权威全文帧（事实核查/审核后覆盖增量区）+ 引用/降级/token 元信息帧
 - **边界加固**：OCR 乱码质检（提分辨率重试→丢弃统计）、知识库无依据拒答、多模态 503 明确降级
+- **SSE 断开保护**：客户端断开 → 取消信号贯穿流水线（阶段边界 + 流式循环逐块检查），worker 线程不再空转；delta 事件驱动排空（替代 50ms 轮询）
+- **供应商参数隔离**：`enable_thinking`（DashScope 混合思考专属）不泄漏到 DeepSeek/千帆；语义去重开关接线（默认关，省每请求 N 次候选 embedding）；query 向量跨检索/grounding 复用
+- **确定性健康工具层**：BMI / 每日饮水量 / 心率区间三工具（注册表结构、关键词触发、参数优先取画像）——数值计算确定性注入上下文，不让 LLM 自行算术（可复现、零 token 成本）；注册表可直接演进为 tools 协议
+- **多轮查询改写**：指代消解后检索（「那硬拉呢」自动补上上一轮的「腰突」上下文），小模型改写 + 异常回退原问题；改写仅作用于检索，原问题仍用于 Prompt/分层/缓存 key
+- **反馈闭环 + 检索可观测**：👍/👎 反馈 → feedback.jsonl → `eval_testset.py --feedback` 回流评测（真实用户不满意的样本驱动迭代）；`/v1/debug/retrieval` 按 request_id 查检索得分——演示时当场展示三路中间过程
 
 ## 🛠️ 技术栈
 
@@ -35,8 +40,8 @@
 ┌───────────────┐  POST /v1/chat/stream (SSE, X-API-Key)   ┌────────────────────────────────┐
 │  app.py       │ ───────────────────────────────────────▶ │  api.py (FastAPI 唯一后端)      │
 │  Streamlit    │ ◀─────────────────────────────────────── │  ├─ require_api_key 鉴权         │
-│  SSE 客户端    │   meta / delta* / citations / done /     │  ├─ 注入检测 + 百度输入审核       │
-│  (零索引/LLM   │   error                                 │  ├─ 网关: 限流/降噪/预算/内存降级  │
+│  SSE 客户端    │   meta / status* / delta* / citations / │  ├─ 注入检测 + 百度输入审核       │
+│  (零索引/LLM   │   answer / done / error                  │  ├─ 网关: 限流/降噪/预算/内存降级  │
 │   依赖)       │                                          │  └─ /healthz /v1/chat /v1/vision │
 └───────────────┘                                          └───────────────┬────────────────┘
                                                                           │ 单进程内（Milvus Lite 约束）
@@ -54,7 +59,7 @@
                                             └─────────────────────┘
 ```
 
-**完整请求链路**：X-API-Key → Prompt 注入检测 → 百度输入审核（流式前）→ 网关限流/降噪 → 实体抽取 → Neo4j 禁忌名单（停用时安全跳过）→ 边界拒绝检查 → HyDE + 双路检索（加权/RRF 融合 + 实体 boost + LLM 重排）→ 知识盲区 CRAG 联网 → grounding 拒答判定（生成前）→ 分层 Prompt + 禁忌注入 → 令牌预算级联截断 → 降级链生成 → 硬性禁忌过滤 → Fact-Check 四类校验（缓存 + CRAG 修正）→ 百度输出审核（展示前）→ 结构化引用 → SSE 分块输出。
+**完整请求链路**：X-API-Key → Prompt 注入检测 → 百度输入审核（流式前）→ 网关限流/降噪 → 实体抽取 → Neo4j 禁忌名单（停用时安全跳过）→ 边界拒绝检查 → 多轮改写（指代消解，仅检索）→ HyDE + 双路检索（加权/RRF 融合 + 实体 boost + LLM 重排）→ 知识盲区 CRAG 联网 → grounding 拒答判定（生成前）→ 分层 Prompt + 禁忌注入 + 工具计算结果（BMI/饮水量/心率，确定性计算）→ 令牌预算级联截断 → 降级链生成 → 硬性禁忌过滤 → Fact-Check 四类校验（缓存 + CRAG 修正）→ 百度输出审核（展示前）→ 结构化引用 → SSE 分块输出。
 
 ## 📦 安装
 
@@ -95,6 +100,11 @@ curl http://127.0.0.1:8000/healthz
 curl -N -X POST http://127.0.0.1:8000/v1/chat/stream \
   -H "X-API-Key: <你的API_KEY_AUTH>" -H "Content-Type: application/json" \
   -d '{"question":"深蹲主要锻炼哪些肌群"}'
+# 反馈 + 检索 debugger（request_id 取自 meta 帧）
+curl -X POST http://127.0.0.1:8000/v1/feedback \
+  -H "X-API-Key: <你的API_KEY_AUTH>" -H "Content-Type: application/json" \
+  -d '{"request_id":"<request_id>","vote":"down","comment":"太笼统"}'
+curl "http://127.0.0.1:8000/v1/debug/retrieval?request_id=<request_id>" -H "X-API-Key: <你的API_KEY_AUTH>"
 ```
 
 ## 🔑 环境变量（.env）
@@ -121,6 +131,7 @@ curl -N -X POST http://127.0.0.1:8000/v1/chat/stream \
 
 - `LLM_TIERS` 在 config 集中配置；重排/校验角色（rerank/fact_check/judge/hyde）全部关闭思考模式（实测 8.4s→0.5s）
 - 分层判定先于检索：simple 层跳过 LLM 重排，一次查询省一次模型调用
+- **simple 层跳过 HyDE 直查**（`HYDE_SKIP_SIMPLE`）：基础问答直查 Hit@3=1.00 已满分，实测 20 条对比直查 0.95/1.00/1.00 vs HyDE 1.00/1.00/1.00（仅 1 条首命中降级），省 1 次 LLM 调用 + 1 次重复检索
 - **并行化**：复合伤病三路召回草稿（HyDE/Step-Back/子问题）并行生成；管线两阶段——检索/共享状态锁内串行（Milvus Lite 约束），云端 LLM 生成锁外并行（实测 3 并发请求 1.3-1.6× 加速；封顶因素为 MaaS 单 Key 并发额度）
 - **Embedding 上云**：qwen3.7-text-embedding（dimensions=768 与 schema 一致，实测批量 41 条/s、8 并发 0.26s 无排队）——检索与本地资源解耦。⚠️ 切换 `EMBEDDING_PROVIDER` 必须重建索引（不同模型向量空间不兼容），并重新校准 `GROUNDING_MIN_SIM`（qwen 嵌入实测校准 0.40）
 - 快模型选型实测：qwen3.7-flash 优于 deepseek-v4-flash / glm-5.2-fast-preview（短任务 0.3s vs 0.9s）
@@ -140,7 +151,8 @@ curl -N -X POST http://127.0.0.1:8000/v1/chat/stream \
 ## 🧪 测试
 
 ```bash
-pytest -q tests/                    # 77 项：适配器降级链/注入/拒答/乱码/API 集成/引用清洗/拒绝原因/网关防护/图谱（mock 打桩）
+pytest -q tests/                    # 141 项：适配器降级链/注入/拒答/乱码/API 集成/引用清洗/拒绝原因/网关防护/图谱/断连取消/供应商参数隔离/分类器回归/健康工具/多轮改写/反馈/检索 debugger（mock 打桩）
+python -u eval_graph.py             # 图谱检索专项评测（mock 确定性；--neo4j 切真实实例）
 python -u eval_testset.py --skip-groups --limit 100   # 检索+生成评测（本地 Ollama）
 python -u eval_testset.py --rrf --limit 20            # RRF 融合模式对比
 python -u eval_testset.py --cloud --limit 20          # 云端评测（需 DASHSCOPE_API_KEY）
@@ -185,6 +197,23 @@ python -u eval_testset.py --cloud --limit 20          # 云端评测（需 DASHS
 > Hit@3 0.06→0.38（+533%）、MRR 0.05→0.30、context_precision 0.01→0.14、relevancy 0.92。
 > 核心 trade-off：放宽候选池→召回↑精度↓ → 实体过滤拉回精度。
 
+### 图谱检索专项评测（eval_graph.py，2026-08-19 新增）
+
+`python -u eval_graph.py`（mock 图谱确定性评测，零网络；`--neo4j` 切真实实例跑同一评测集）。
+图谱证据源（contra_data 28 类伤病）与 KB 文档是两套系统，Hit@k 口径不适用——专项口径：
+
+| 指标 | 得分 |
+|---|---|
+| 单伤病禁忌召回@5 / Top-1 禁忌 | **100% / 100%** |
+| 复合伤病双伤病路径覆盖（top-3） | **100%** |
+| 校验断言（差异化评分 / 深度衰减 / 禁忌 boost / 矛盾标注） | 3/3 PASS |
+
+> 评测驱动修出 4 个图谱逻辑 bug（Neo4j 停用期不可见）：① `_score_relation` 从描述判分，
+> 但关系标签在类型名里 → 双源匹配；② multi-hop 评分 `1/hops` 让 1-hop 康复=1.0 与禁忌无区分
+> → 标签基础分×深度衰减；③ 检索结果先截断后排序 → 高分禁忌路径被挤出 top-k；④ 单伤病误判复合
+> （"肩袖损伤"拆词计数 / "综合征"含"综合"标记子串 / 部位名是伤病名组成部分）→ 实体词典贪心计数
+> + 标记词独立判定。修复后禁忌召回 68.4%→100%、复合覆盖 0%→100%。
+
 ## ⚖️ 数据合规声明（面试话术）
 
 - **知识库来源（已落地）**：`TEXT_KB_SOURCES` 配置两份公开发布的官方健康科普资料，**文本直抽入库（零 OCR）**：
@@ -215,10 +244,12 @@ python -u eval_testset.py --cloud --limit 20          # 云端评测（需 DASHS
 ├── text_quality.py        # OCR 乱码质检（摄入层）
 ├── retriever.py           # 双路检索 + weighted/RRF 融合 + [Neo4j 可插拔]
 ├── reranker.py            # LLM listwise 重排序
-├── hyde.py                # HyDE + Step-Back + 问题分解
+├── hyde.py                # HyDE + Step-Back + 问题分解 + 多轮改写
+├── health_tools.py        # 确定性健康工具层（BMI/饮水量/心率区间，注册表结构）
 ├── fact_checker.py        # 四类事实校验
 ├── fact_cache.py          # 校验结果缓存（LRU）
 ├── gateway.py             # 网关（限流/降噪/预算/内存）+ 结构化日志
+├── log_reader.py          # gateway.log 检索事件读取（/v1/debug/retrieval 数据源）
 ├── crag_search.py         # CRAG 博查联网搜索
 ├── app.py                 # Streamlit 客户端（零索引依赖；智能问答 + 图谱 + 图文解读三视图）
 ├── build_index.py         # 索引构建（OCR 质检 + Milvus + BM25 + [Neo4j]）

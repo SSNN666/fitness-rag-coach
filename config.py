@@ -56,12 +56,13 @@ MILVUS_DIM = 768                     # nomic-embed-text 输出维度
 MILVUS_GRPC_OPTIONS = {"grpc.keepalive_time_ms": 2147483647}
 
 # ============================================================
-# Neo4j AuraDB 知识图谱（云端免费实例）
+# Neo4j AuraDB 知识图谱（云端免费实例；默认停用 NEO4J_ENABLED=False）
+# 连接信息全部走 .env —— 历史版本曾硬编码实例 URI（已移除，凭证已轮换）
 # ============================================================
-NEO4J_URI = "neo4j+s://04e61057.databases.neo4j.io"
-NEO4J_USER = "04e61057"
+NEO4J_URI = os.getenv("NEO4J_URI", "")
+NEO4J_USER = os.getenv("NEO4J_USER", "")
 NEO4J_PASSWORD = os.getenv("NEO4J_PASSWORD", "")  # 密钥位于 .env，勿硬编码
-NEO4J_DATABASE = "04e61057"
+NEO4J_DATABASE = os.getenv("NEO4J_DATABASE", "neo4j")
 
 # ============================================================
 # BM25 关键词检索（纯 Python rank-bm25）
@@ -156,6 +157,9 @@ CHUNK_OVERLAP_RATIO = 0.15
 # ============================================================
 HYDE_ENABLED = True
 HYDE_TOP_K = 3
+# simple 层跳过 HyDE 直查：基础问答直查 Hit@3=1.00 已满分，草稿改写增益有限却费时
+# （省 1 次 LLM 调用 + 1 次重复检索，simple 层首 token 更快）；置 False 恢复 HyDE 草稿检索
+HYDE_SKIP_SIMPLE = True
 
 # 伤病关键词（≥2字，避免单字误匹配健身动作名）
 HYDE_INJURY_KEYWORDS = [
@@ -272,10 +276,10 @@ MEMORY_GUARD_DEGRADED_MODEL = "qwen2.5:1.5b"
 
 # ============================================================
 # ★ 统一大模型适配器（康养 Demo 改造）
-#   主链路云端（阿里云百炼 DashScope），千帆可选，Ollama 仅本地调试/兜底
+#   主链路云端（阿里云百炼 DashScope → DeepSeek → 千帆 ERNIE），Ollama 仅本地调试/兜底
 # ============================================================
 LLM_PROVIDER_PRIMARY = "dashscope"      # 主链路供应商："dashscope" | "ollama"（全本地调试）
-LLM_FALLBACK_CHAIN = ["dashscope", "qianfan", "ollama"]  # 降级链顺序；未配 Key 的供应商自动跳过
+LLM_FALLBACK_CHAIN = ["dashscope", "deepseek", "qianfan", "ollama"]  # 降级链顺序；未配 Key 的供应商自动跳过
 LLM_LOCAL_FALLBACK_ENABLED = True       # 云端全部失败时是否落本地 Ollama
 
 DASHSCOPE_API_KEY = os.getenv("DASHSCOPE_API_KEY", "")   # 密钥位于 .env，勿硬编码
@@ -283,6 +287,8 @@ DASHSCOPE_BASE_URL = os.getenv(                         # 私有 MaaS 部署用�
     "DASHSCOPE_BASE_URL",
     "https://dashscope.aliyuncs.com/compatible-mode/v1",
 )  # OpenAI 兼容模式
+DEEPSEEK_API_KEY = os.getenv("DEEPSEEK_API_KEY", "")     # DeepSeek 开放平台（OpenAI 兼容）
+DEEPSEEK_BASE_URL = "https://api.deepseek.com/v1"
 QIANFAN_API_KEY = os.getenv("QIANFAN_API_KEY", "")       # 可选第二云供应商（千帆 ERNIE）
 QIANFAN_BASE_URL = "https://qianfan.baidubce.com/v2"
 OLLAMA_BASE_URL = "http://localhost:11434"
@@ -292,19 +298,19 @@ LLM_LOCAL_TIMEOUT = 300.0               # 本地 Ollama 超时（CPU 推理慢�
 LLM_MAX_RETRIES = 2                     # 单供应商内可重试次数（额度不足/鉴权/上下文超长不盲目重试）
 LLM_RETRY_BACKOFF = (1.0, 2.0)          # 重试退避秒数
 
-# 角色 → 各供应商模型映射 + 生成参数（vision 本地无 VL 模型 → 云失败时返回明确提示）
+# 角色 → 各供应商模型映射 + 生成参数（vision 仅 qwen3-vl-plus：VL 只做图像理解，本地无 VL → 云失败返回明确提示）
 # 注：私有 MaaS 部署无 qwen-plus 公共型号，按 models.list() 实际可用名映射
 # thinking: 混合思考开关（仅 DashScope 生效）。qwen3.7 默认思考模式极慢（实测 8.4s vs 0.5s），
 #           短回答类任务（快速问答/重排/校验/判分）全部关闭；复杂伤病问答保留思考保质量
 LLM_ROLES = {
-    "chat":         {"dashscope": "qwen3.7-plus", "qianfan": "ernie-4.5-turbo-128k", "ollama": "qwen2.5:7b", "temperature": 0.7, "max_tokens": None, "thinking": True, "thinking_budget": 2048},
-    "chat_nothink": {"dashscope": "qwen3.7-plus", "qianfan": "ernie-4.5-turbo-128k", "ollama": "qwen2.5:7b", "temperature": 0.7, "max_tokens": None, "thinking": False},
-    "chat_fast":    {"dashscope": "qwen3.7-flash", "qianfan": "ernie-speed-128k", "ollama": "qwen2.5:7b", "temperature": 0.7, "max_tokens": 400, "thinking": False},
-    "hyde":         {"dashscope": "qwen3.7-flash", "qianfan": "ernie-speed-128k", "ollama": "qwen2.5:0.5b", "temperature": 0.7, "max_tokens": 256, "thinking": False},
-    "fact_check":   {"dashscope": "qwen3.7-flash", "qianfan": "ernie-speed-128k", "ollama": "qwen2.5:1.5b", "temperature": 0.0, "max_tokens": 128, "thinking": False},
-    "rerank":       {"dashscope": "qwen3.7-flash", "qianfan": "ernie-speed-128k", "ollama": "qwen2.5:7b", "temperature": 0.0, "max_tokens": 32, "thinking": False},
-    "judge":        {"dashscope": "qwen3.7-flash", "qianfan": "ernie-speed-128k", "ollama": "qwen2.5:7b", "temperature": 0.0, "max_tokens": 8, "thinking": False},
-    "vision":       {"dashscope": "qwen3-vl-plus-2025-12-19", "qianfan": "ernie-4.5-turbo-128k", "ollama": None, "temperature": 0.3, "max_tokens": 1024},
+    "chat":         {"dashscope": "qwen3.7-plus", "deepseek": "deepseek-chat", "qianfan": "ernie-4.5-turbo-128k", "ollama": "qwen2.5:7b", "temperature": 0.7, "max_tokens": None, "thinking": True, "thinking_budget": 2048},
+    "chat_nothink": {"dashscope": "qwen3.7-plus", "deepseek": "deepseek-chat", "qianfan": "ernie-4.5-turbo-128k", "ollama": "qwen2.5:7b", "temperature": 0.7, "max_tokens": None, "thinking": False},
+    "chat_fast":    {"dashscope": "qwen3.7-flash", "deepseek": "deepseek-chat", "qianfan": "ernie-4.5-turbo-32k", "ollama": "qwen2.5:7b", "temperature": 0.7, "max_tokens": 400, "thinking": False},
+    "hyde":         {"dashscope": "qwen3.7-flash", "deepseek": "deepseek-chat", "qianfan": "ernie-4.5-turbo-32k", "ollama": "qwen2.5:0.5b", "temperature": 0.7, "max_tokens": 256, "thinking": False},
+    "fact_check":   {"dashscope": "qwen3.7-flash", "deepseek": "deepseek-chat", "qianfan": "ernie-4.5-turbo-32k", "ollama": "qwen2.5:1.5b", "temperature": 0.0, "max_tokens": 128, "thinking": False},
+    "rerank":       {"dashscope": "qwen3.7-flash", "deepseek": "deepseek-chat", "qianfan": "ernie-4.5-turbo-32k", "ollama": "qwen2.5:7b", "temperature": 0.0, "max_tokens": 32, "thinking": False},
+    "judge":        {"dashscope": "qwen3.7-flash", "deepseek": "deepseek-chat", "qianfan": "ernie-4.5-turbo-32k", "ollama": "qwen2.5:7b", "temperature": 0.0, "max_tokens": 8, "thinking": False},
+    "vision":       {"dashscope": "qwen3-vl-plus-2025-12-19", "ollama": None, "temperature": 0.3, "max_tokens": 1024},
 }
 
 # ============================================================
@@ -345,8 +351,8 @@ NEO4J_ENABLED = False
 API_HOST = "127.0.0.1"
 API_PORT = 8000
 API_KEY_AUTH = os.getenv("API_KEY_AUTH", "")   # 演示级鉴权：非空则要求 X-API-Key 头；空=本地免鉴权
-SSE_BUFFER_FIRST = True                # SSE 缓冲模式：先完整生成→输出审核→再分块吐出（审核先于展示）
-SSE_CHUNK_CHARS = 24                   # 缓冲模式下每块字符数（视觉流式）
+SSE_BUFFER_FIRST = False               # 已改为真流式（token 级 delta 实时透出）；保留开关仅供兼容
+SSE_CHUNK_CHARS = 24                   # 真流式下不再使用（仅兼容保留）
 
 # ============================================================
 # 防护：Prompt 注入检测 + 百度内容审核
@@ -362,6 +368,13 @@ CENSOR_TIMEOUT = 3.0                   # 审核超时秒数（超时 fail-open �
 # 拒答（grounding）：知识库无依据时拒绝回答（生成前判定）
 # ============================================================
 REFUSE_ENABLED = True
+UNFOUNDED_DISCLAIMER = (
+    "\n\n> ⚠️ 提示：知识库未检索到直接相关依据，以上内容基于通用知识生成，"
+    "仅供科普参考，不构成专业建议，请咨询专业人士。"
+)
+# 检索侧 OOM 防线：可用内存低于阈值 → 仅 BM25 稀疏检索（Milvus/图谱跳过）
+RETRIEVAL_MEMORY_GUARD_ENABLED = True
+RETRIEVAL_MEMORY_THRESHOLD_GB = 1.0
 GROUNDING_MIN_CTX_CHARS = 80           # 上下文低于此字数且无外部资料 → 拒答
 GROUNDING_MIN_SCORE = None             # weighted 模式最低融合分（None=沿用 FUSION_THRESHOLD）
 GROUNDING_MIN_SIM = 0.40               # 无实体查询的语义相关性硬门槛：query 与 top 文档最大余弦低于此值 → 拒答
@@ -378,6 +391,25 @@ OCR_QUALITY_CHAR_RATIO = 0.6           # 合法字符占比阈值
 OCR_QUALITY_DICT_COVERAGE = 0.35       # jieba 词典命中率阈值（康养术语 OOV 多，放宽）
 OCR_QUALITY_REPETITION = 0.3           # 最高频单字符占比阈值（>此值判乱码）
 OCR_QUALITY_RETRY_SIZE = 2400          # 乱码页提分辨率重试的降采样边长
+
+# ============================================================
+# 确定性健康工具层（BMI / 饮水量 / 心率区间——计算注入上下文，
+# 不让 LLM 自行算术；注册表结构可演进为 tools 协议）
+# ============================================================
+HEALTH_TOOLS_ENABLED = True
+
+# ============================================================
+# 多轮查询改写（指代消解后检索：会话历史只进 messages 时，
+# 第二轮「那硬拉呢」的检索没有上一轮「腰突」上下文）
+# ============================================================
+REWRITE_ENABLED = True
+
+# ============================================================
+# 用户反馈闭环（POST /v1/feedback → feedback.jsonl，
+# eval_testset.py --feedback 消费负反馈问题跑质量报告）
+# ============================================================
+FEEDBACK_PATH = "feedback.jsonl"
+FEEDBACK_MAX_RECENT = 200      # 内存保留最近应答数（反馈按 request_id 解析）
 
 # ============================================================
 # 评测供应商（默认本地 Ollama 防烧钱；--cloud 切云端）

@@ -120,6 +120,26 @@ class TestFallbackChain:
         assert pieces[-1] == "后续"
 
 
+class TestThinkingFieldIsolation:
+    """enable_thinking 是 DashScope 混合思考模型专属字段：其他 OpenAI 兼容端点不得下发。"""
+
+    def test_deepseek_qianfan_no_extra_body(self):
+        from llm_adapter import DeepSeekAdapter, QianfanAdapter
+        for cls in (DeepSeekAdapter, QianfanAdapter):
+            a = cls(model="m", api_key="k", enable_thinking=False)
+            kw = a._base_kwargs([{"role": "user", "content": "hi"}], 0.7, None, False, None)
+            assert "extra_body" not in kw, f"{cls.__name__} 不应下发 enable_thinking"
+
+    def test_dashscope_sends_thinking_controls(self):
+        from llm_adapter import DashScopeAdapter
+        off = DashScopeAdapter(model="m", api_key="k", enable_thinking=False)
+        kw = off._base_kwargs([{"role": "user", "content": "hi"}], 0.7, None, False, None)
+        assert kw["extra_body"] == {"enable_thinking": False}
+        on = DashScopeAdapter(model="m", api_key="k", enable_thinking=True, thinking_budget=2048)
+        kw2 = on._base_kwargs([{"role": "user", "content": "hi"}], 0.7, None, False, None)
+        assert kw2["extra_body"] == {"enable_thinking": True, "thinking_budget": 2048}
+
+
 class TestBuildLLM:
     def test_unconfigured_cloud_providers_skipped(self, monkeypatch):
         import config as cfg

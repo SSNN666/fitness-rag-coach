@@ -1,4 +1,6 @@
 """pipeline 本地禁忌降级单测（仅静态方法，不加载服务）。"""
+import threading
+
 from pipeline import PipelineService
 
 
@@ -136,6 +138,150 @@ def test_session_store_lru_eviction():
 
 
 # ----------------------------------------------------------------
+# stop_event 取消（SSE 断开保护）
+# ----------------------------------------------------------------
+
+def test_answer_cancelled_before_generation_returns_early():
+    """stop_event 预置位 → 流水线在检索/生成前及时退出。"""
+
+    class _DummyRetriever:
+        def get_contraindications(self, names):
+            return {}
+
+    stop = threading.Event()
+    stop.set()
+    svc = PipelineService(retriever=_DummyRetriever(), llms={}, gateway=None,
+                          fact_engine=None, fact_cache=None, store={})
+    result = svc.answer("深蹲练什么肌肉", stop_event=stop)
+    assert result.answer == ""           # 未进入生成即退出
+    assert result.request_id             # 仍返回带 request_id 的占位结果
+
+
+class _Chunk:
+    def __init__(self, text=""):
+        self.text = text
+        self.usage = None
+        self.fallback_switch = False
+
+
+class _FakeGateway:
+    """记录型假网关：默认放行/记录，不触网。"""
+    def log_cycle(self, *a, **k): pass
+    def log_retrieval(self, *a, **k): pass
+    def log_prompt(self, *a, **k): pass
+    def log_answer(self, *a, **k): pass
+    def log_usage(self, *a, **k): pass
+    def guard_token_budget(self, system_prompt, history, session_id, ctx, query):
+        return ctx
+    def get_active_llm(self, llm): return llm
+
+
+class _FakeResp:
+    content = "深蹲康复训练草稿"
+    usage = None
+    fallback = False
+    error_kind = None
+
+
+class _FakeChain:
+    active_providers = []
+
+    def __init__(self, stop_event):
+        self._stop = stop_event
+
+    def invoke(self, messages, **kw):
+        return _FakeResp()
+
+    def stream_events(self, messages, **kw):
+        yield _Chunk("第一段回答。")
+        self._stop.set()          # 模拟客户端在流中途断开
+        yield _Chunk("第二段回答。")
+
+
+def test_answer_stop_event_interrupts_streaming(monkeypatch):
+    """流式中 stop_event 置位 → 及时中断，丢弃部分结果且不写历史。"""
+    import pipeline as pipeline_mod
+    # 注：pipeline 用 `from config import *` 拉取模块级常量，需 patch pipeline 模块本身
+    monkeypatch.setattr(pipeline_mod, "REFUSE_ENABLED", False)   # 检索为空时不拒答，走生成路径
+
+    stop = threading.Event()
+
+    class _DummyRetriever:
+        def get_contraindications(self, names):
+            return {}
+        # 无 similarity_search/search_with_scores → 检索异常路径（try/except 兜底）
+
+    store: dict = {}
+    svc = PipelineService(
+        retriever=_DummyRetriever(),
+        llms={"hyde": _FakeChain(stop), "chat_fast": _FakeChain(stop),
+              "chat": _FakeChain(stop)},
+        gateway=_FakeGateway(), fact_engine=None, fact_cache=None, store=store)
+
+    deltas: list[str] = []
+    result = svc.answer("深蹲练什么肌肉", stop_event=stop, on_delta=deltas.append)
+    assert result.answer == "第一段回答。"   # 第二段到来前已取消
+    assert deltas == ["第一段回答。"]
+    assert store == {}                    # 取消时不写会话历史
+
+
+class _SpyChain(_FakeChain):
+    """记录型假链：统计 invoke/stream_events 调用次数。"""
+
+    def __init__(self, stop_event):
+        super().__init__(stop_event)
+        self.invokes = 0
+        self.streams = 0
+
+    def invoke(self, messages, **kw):
+        self.invokes += 1
+        return _FakeResp()
+
+    def stream_events(self, messages, **kw):
+        self.streams += 1
+        return super().stream_events(messages, **kw)
+
+
+class _DummyRetriever:
+    def get_contraindications(self, names):
+        return {}
+    # 无 similarity_search/search_with_scores → 检索异常路径（try/except 兜底）
+
+
+def test_simple_tier_skips_hyde(monkeypatch):
+    """simple 层跳过 HyDE 草稿生成（省 1 次 LLM 调用）：直查结果即引用来源。"""
+    import pipeline as pipeline_mod
+    monkeypatch.setattr(pipeline_mod, "REFUSE_ENABLED", False)
+
+    stop = threading.Event()
+    hyde = _SpyChain(stop)
+    chat_fast = _SpyChain(stop)
+    store: dict = {}
+    svc = PipelineService(
+        retriever=_DummyRetriever(),
+        llms={"hyde": hyde, "chat_fast": chat_fast, "chat": _SpyChain(stop)},
+        gateway=_FakeGateway(), fact_engine=None, fact_cache=None, store=store)
+    svc.answer("深蹲练什么肌肉")
+    assert hyde.invokes == 0       # simple 层不生成 HyDE 草稿
+    assert chat_fast.invokes == 1  # 直查后正常生成
+
+
+def test_injury_tier_still_uses_hyde(monkeypatch):
+    """injury 层仍走 HyDE（伤病问题依赖草稿改写召回）。"""
+    import pipeline as pipeline_mod
+    monkeypatch.setattr(pipeline_mod, "CRAG_ENABLED", False)   # 防测试触网
+
+    stop = threading.Event()
+    hyde = _SpyChain(stop)
+    svc = PipelineService(
+        retriever=_DummyRetriever(),
+        llms={"hyde": hyde, "chat_fast": _SpyChain(stop), "chat": _SpyChain(stop)},
+        gateway=_FakeGateway(), fact_engine=None, fact_cache=None, store={})
+    svc.answer("腰突怎么康复")
+    assert hyde.invokes == 1       # injury 层保留 HyDE
+
+
+# ----------------------------------------------------------------
 # 引用片段清洗（_clean_snippet）
 # ----------------------------------------------------------------
 
@@ -169,3 +315,142 @@ def test_clean_snippet_no_boundary_falls_back_to_ellipsis():
 def test_clean_snippet_empty_and_residue_only():
     assert PipelineService._clean_snippet("") == ""
     assert PipelineService._clean_snippet("  \n 2, ") == ""
+
+
+# ----------------------------------------------------------------
+# 确定性健康工具注入（Phase E）+ 多轮查询改写（Phase B/C）
+# ----------------------------------------------------------------
+
+class _SearchableRetriever:
+    """可完成检索的桩：search_with_scores 记录 query 并返回单文档。"""
+    def __init__(self):
+        self.seen_queries: list[str] = []
+        self._last_query_embedding = None
+
+    def get_contraindications(self, names):
+        return {}
+
+    def search_with_scores(self, query, k=3, use_rerank=False):
+        self.seen_queries.append(query)
+        from langchain_core.documents import Document
+        doc = Document(
+            page_content="深蹲动作要点：膝关节与脚尖方向保持一致，核心收紧，"
+                         "下蹲至大腿与地面平行后起身。",
+            metadata={"source": "fitness_data.csv", "动作名称": "深蹲"})
+        return [(doc, 0.9)]
+
+    def _embed(self, text):
+        return [0.1] * 768
+
+    def set_degraded(self, v):
+        pass
+
+
+class _CaptureChain(_FakeChain):
+    """记录型假链：捕获最近一次 invoke 的 messages。"""
+    def __init__(self, stop_event):
+        super().__init__(stop_event)
+        self.last_messages = None
+
+    def invoke(self, messages, **kw):
+        self.last_messages = messages
+        return _FakeResp()
+
+
+def test_tool_results_injected_into_context(monkeypatch):
+    """健康工具触发 → [工具计算结果] 注入 system 上下文 + 结构化引用 kind=tool。"""
+    import pipeline as pipeline_mod
+    from health_tools import ToolResult
+
+    monkeypatch.setattr(pipeline_mod, "REFUSE_ENABLED", False)   # 检索空路径不拒答
+    monkeypatch.setattr(pipeline_mod, "HEALTH_TOOLS_ENABLED", True)
+    monkeypatch.setattr(
+        pipeline_mod, "run_health_tools",
+        lambda q, p: [ToolResult(name="calculate_bmi", title="BMI 计算",
+                                 content="身高170cm、体重70kg → BMI=24.2，属超重")])
+
+    stop = threading.Event()
+    chat_fast = _CaptureChain(stop)
+    svc = PipelineService(
+        retriever=_SearchableRetriever(),
+        llms={"hyde": _SpyChain(stop), "chat_fast": chat_fast, "chat": _SpyChain(stop)},
+        gateway=_FakeGateway(), fact_engine=None, fact_cache=None, store={})
+    result = svc.answer("帮我算下BMI", user_profile="身高170cm，体重70kg，目标：减脂")
+
+    sys_content = chat_fast.last_messages[0]["content"]
+    assert "[工具计算结果]" in sys_content
+    assert "BMI=24.2" in sys_content
+    # 工具结果作为引用暴露（前端按 kind 渲染卡片）
+    assert any(c["kind"] == "tool" and c["source"] == "BMI 计算" for c in result.citations)
+
+
+def test_tool_injection_disabled_no_context_marker(monkeypatch):
+    """HEALTH_TOOLS_ENABLED=False → 无 [工具计算结果] 标记。"""
+    import pipeline as pipeline_mod
+    monkeypatch.setattr(pipeline_mod, "REFUSE_ENABLED", False)
+    monkeypatch.setattr(pipeline_mod, "HEALTH_TOOLS_ENABLED", False)
+
+    stop = threading.Event()
+    chat_fast = _CaptureChain(stop)
+    svc = PipelineService(
+        retriever=_SearchableRetriever(),
+        llms={"hyde": _SpyChain(stop), "chat_fast": chat_fast, "chat": _SpyChain(stop)},
+        gateway=_FakeGateway(), fact_engine=None, fact_cache=None, store={})
+    svc.answer("帮我算下BMI", user_profile="身高170cm，体重70kg")
+    assert "[工具计算结果]" not in chat_fast.last_messages[0]["content"]
+
+
+def test_cache_key_profile_fingerprint_when_tools_triggered():
+    """工具触发时缓存 key 含画像指纹：同问题不同画像不共享缓存（防旧画像答案串用）。"""
+    from health_tools import ToolResult
+    t = [ToolResult(name="calculate_bmi", title="BMI 计算", content="x")]
+    k1 = PipelineService._cache_key_entities(
+        "帮我算下BMI", False, t, "身高170cm，体重70kg")
+    k2 = PipelineService._cache_key_entities(
+        "帮我算下BMI", False, t, "身高180cm，体重80kg")
+    assert k1 != k2
+    # 无工具触发时画像不参与 key（与旧行为一致，不误伤缓存命中率）
+    k0 = PipelineService._cache_key_entities("帮我算下BMI", False, None, "身高180cm，体重80kg")
+    assert k0 == PipelineService._cache_key_entities("帮我算下BMI", False, None, None)
+
+
+def test_rewrite_used_for_retrieval(monkeypatch):
+    """多轮指代问句 → 改写后的 retrieval_q 用于检索；原 question 仍进 Prompt。"""
+    import pipeline as pipeline_mod
+    monkeypatch.setattr(pipeline_mod, "REFUSE_ENABLED", False)
+    monkeypatch.setattr(pipeline_mod, "REWRITE_ENABLED", True)
+    monkeypatch.setattr(pipeline_mod, "CRAG_ENABLED", False)
+    monkeypatch.setattr(pipeline_mod, "rewrite_query",
+                        lambda q, h, llm: "腰突患者可以做硬拉吗")
+
+    stop = threading.Event()
+    retriever = _SearchableRetriever()
+    chat_fast = _CaptureChain(stop)
+    svc = PipelineService(
+        retriever=retriever,
+        llms={"hyde": _SpyChain(stop), "chat_fast": chat_fast, "chat": _SpyChain(stop)},
+        gateway=_FakeGateway(), fact_engine=None, fact_cache=None, store={})
+    svc._append_history("default", "腰突能深蹲吗", "不建议深蹲，会加重腰椎负担。")
+    svc.answer("那硬拉呢", session_id="default")
+
+    assert retriever.seen_queries and retriever.seen_queries[0] == "腰突患者可以做硬拉吗"
+    assert chat_fast.last_messages[-1]["content"] == "那硬拉呢"   # Prompt 用原问题
+
+
+def test_rewrite_disabled_uses_original_question(monkeypatch):
+    """REWRITE_ENABLED=False → 检索直接用原问题（回归保护）。"""
+    import pipeline as pipeline_mod
+    monkeypatch.setattr(pipeline_mod, "REFUSE_ENABLED", False)
+    monkeypatch.setattr(pipeline_mod, "REWRITE_ENABLED", False)
+    monkeypatch.setattr(pipeline_mod, "CRAG_ENABLED", False)
+
+    stop = threading.Event()
+    retriever = _SearchableRetriever()
+    svc = PipelineService(
+        retriever=retriever,
+        llms={"hyde": _SpyChain(stop), "chat_fast": _SpyChain(stop),
+              "chat": _SpyChain(stop)},
+        gateway=_FakeGateway(), fact_engine=None, fact_cache=None, store={})
+    svc._append_history("default", "腰突能深蹲吗", "不建议深蹲，会加重腰椎负担。")
+    svc.answer("那硬拉呢", session_id="default")
+    assert retriever.seen_queries[0] == "那硬拉呢"

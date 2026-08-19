@@ -83,6 +83,66 @@ def _stream_events(question: str, session_id: str):
             yield data.get("event"), data
 
 
+def _post_feedback(request_id: str, vote: str) -> None:
+    """上报 👍/👎 反馈到后端（失败静默——反馈不阻断聊天）。"""
+    try:
+        headers = {"Content-Type": "application/json"}
+        if API_KEY:
+            headers["X-API-Key"] = API_KEY
+        httpx.post(f"{API_BASE}/v1/feedback",
+                   json={"request_id": request_id, "vote": vote},
+                   headers=headers, timeout=5.0)
+    except httpx.HTTPError:
+        pass
+
+
+def _render_feedback_buttons(key_suffix, request_id: str) -> None:
+    """👍/👎 反馈按钮（key 按消息序号唯一；点击后静默上报 + toast）。
+
+    与 _render_graph_button 同理：渲染在 st.chat_input 块之外，点击事件才不丢。
+    """
+    if not request_id:
+        return
+    c1, c2, _ = st.columns([1, 1, 6])
+    if c1.button("👍", key=f"fb_up_{key_suffix}", help="回答有帮助"):
+        _post_feedback(request_id, "up")
+        st.toast("👍 已记录好评，谢谢！")
+    if c2.button("👎", key=f"fb_down_{key_suffix}", help="回答不满意"):
+        _post_feedback(request_id, "down")
+        st.toast("👎 已记录，我们会持续改进")
+
+
+def _render_retrieval_debug(request_id: str) -> None:
+    """🔍 检索详情展开器：按 request_id 拉取 gateway.log 中的检索片段（调试/演示）。"""
+    if not request_id:
+        return
+    try:
+        headers = {}
+        if API_KEY:
+            headers["X-API-Key"] = API_KEY
+        r = httpx.get(f"{API_BASE}/v1/debug/retrieval",
+                      params={"request_id": request_id},
+                      headers=headers, timeout=5.0)
+        if r.status_code != 200:
+            return
+        data = r.json()
+        with st.expander("🔍 检索详情（调试）"):
+            st.caption(f"检索 query：{data.get('query', '')}")
+            docs = data.get("docs") or []
+            if not docs:
+                st.caption("无检索文档记录")
+            for d in docs:
+                src = d.get("source", "未知来源")
+                page = d.get("page")
+                score = d.get("score")
+                snip = (d.get("snippet") or "")[:100]
+                score_txt = f" · score={score:.3f}" if score is not None else ""
+                page_txt = f" · 第{page}页" if page else ""
+                st.markdown(f"- **{src}**{page_txt}{score_txt}\n  {snip}")
+    except httpx.HTTPError:
+        pass
+
+
 def _render_graph_button(focus: list[str], is_contra: bool, msg_idx: int) -> None:
     """渲染「查看图谱」按钮；点击 → 跳图谱视图 + 聚焦伤病（key 按消息序号唯一）。
 
@@ -132,6 +192,10 @@ if nav == "💬 智能问答":
             if (msg["role"] == "assistant" and i == len(st.session_state.messages) - 1
                     and msg.get("focus")):
                 _render_graph_button(msg["focus"], msg.get("is_contra", False), i)
+            # 反馈按钮 + 检索详情（历史消息均渲染；key 按消息序号唯一）
+            if msg["role"] == "assistant" and msg.get("request_id"):
+                _render_feedback_buttons(i, msg["request_id"])
+                _render_retrieval_debug(msg["request_id"])
 
     if prompt_input := st.chat_input("请输入你的健身问题..."):
         st.session_state.messages.append({"role": "user", "content": prompt_input})
@@ -149,15 +213,24 @@ if nav == "💬 智能问答":
             grounded = True   # refusal=True 且 grounded=True → 禁忌拒绝；grounded=False → 无依据拒答
             done_info: dict = {}
             error_msg: str | None = None
+            banner_msg: str | None = None
+            request_id: str = ""   # meta 帧携带；反馈/检索详情按此关联
 
             try:
                 for event, data in _stream_events(prompt_input, SESSION_ID):
-                    if event == "status":
+                    if event == "meta":
+                        banner_msg = data.get("banner")   # 内存降级横幅（仅首次降级时非空）
+                        request_id = data.get("request_id", "")
+                    elif event == "status":
                         # 流水线阶段进度（生成前的等待期反馈；delta 到来后覆盖）
                         holder.markdown(f"🔄 {data.get('stage', '处理中…')} ▌")
                     elif event == "delta":
                         answer_parts.append(data.get("text", ""))
                         holder.markdown("".join(answer_parts) + " ▌")
+                    elif event == "answer":
+                        # 权威全文(事实核查/硬过滤/审核后的最终文本)→ 覆盖增量区
+                        answer_parts = [data.get("text", "")]
+                        holder.markdown(data.get("text", "") + " ▌")
                     elif event == "citations":
                         citations = data.get("docs", [])
                         refusal = data.get("refusal", False)
@@ -183,9 +256,13 @@ if nav == "💬 智能问答":
             st.session_state.messages.append({
                 "role": "assistant", "content": final,
                 "focus": focus, "is_contra": is_contra,
+                "request_id": request_id,   # 历史消息的反馈/检索详情入口需要它
             })
 
             if not error_msg:
+                if banner_msg:
+                    st.warning(banner_msg)
+
                 if done_info.get("fallback_active"):
                     st.info("⚡ 云端模型不可用，本次回答由本地模型生成（降级链已生效）。")
 
@@ -208,6 +285,10 @@ if nav == "💬 智能问答":
                 #   实测「腰突」类咨询型问题不触发拒绝/过滤，但回答含大量禁忌信息，同样需要入口）
                 if focus:
                     _render_graph_button(focus, is_contra, len(st.session_state.messages) - 1)
+
+                # 反馈按钮 + 检索详情（当前 run；key 用 "current" 与历史循环的序号键区分）
+                _render_feedback_buttons("current", request_id)
+                _render_retrieval_debug(request_id)
 
                 usage = done_info.get("usage") or []
                 if usage:

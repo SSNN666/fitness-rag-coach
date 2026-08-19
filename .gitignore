@@ -26,6 +26,9 @@ pdf_ocr_cache.json
 gateway.log
 *.log
 
+# 用户反馈数据（含用户问题与评价，运行时生成，不入库）
+feedback.jsonl
+
 # 知识图谱页运行时生成（echarts.min.js 为静态依赖需入库，graph.html 每次重跑覆盖）
 static/graph.html
 
@@ -46,6 +49,9 @@ kb_*.docx
 # 操作系统文件
 .DS_Store
 Thumbs.db
+
+# 屏幕截图等临时文件
+屏幕截图*.png
 
 # 依赖文件（除了 pyproject.toml 和 requirements.txt 外，其他的类似 .uv 缓存可以忽略）
 .uv/

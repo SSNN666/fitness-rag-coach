@@ -28,6 +28,7 @@ os.environ.setdefault("OLLAMA_MAX_LOADED_MODELS", "2")
 USE_HYDE = "--hyde" in sys.argv
 USE_RRF = "--rrf" in sys.argv          # 临时切 RRF 融合模式（与 weighted 对比用）
 USE_CLOUD = "--cloud" in sys.argv      # 评测用云端 LLM（默认本地 Ollama 防烧钱）
+USE_FEEDBACK = "--feedback" in sys.argv   # 反馈闭环：评测真实用户负反馈问题（无金标准）
 EVAL_PROVIDER = "dashscope" if USE_CLOUD else EVAL_PROVIDER
 
 
@@ -108,6 +109,30 @@ for i, arg in enumerate(sys.argv):
     if arg == "--limit" and i + 1 < len(sys.argv):
         df = df.head(int(sys.argv[i + 1]))
 print(f"[OK] Loaded {len(df)} test samples")
+
+# --feedback 模式：读取反馈文件的负反馈问题（真实用户不满意的样本回流评测）--
+if USE_FEEDBACK:
+    feedback_queries = []
+    try:
+        with open(FEEDBACK_PATH, encoding="utf-8") as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    rec = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                if rec.get("vote") == "down" and rec.get("question"):
+                    feedback_queries.append(rec["question"])
+    except FileNotFoundError:
+        feedback_queries = []
+    if not feedback_queries:
+        print(f"[INFO] {FEEDBACK_PATH} 中无负反馈样本，跳过 --feedback 评测")
+        sys.exit(0)
+    # 去重保持出现顺序
+    df = pd.DataFrame({"query": list(dict.fromkeys(feedback_queries))})
+    print(f"[OK] 反馈评测集: {len(df)} 条真实用户负反馈问题（无金标准参考，跳过 Hit@k 口径）")
 
 
 # -- 余弦相似度 --------------------------------------------
@@ -268,6 +293,49 @@ def compute_ragas():
     return {k: round(v / total, 4) for k, v in scores.items()}
 
 
+def compute_feedback_report():
+    """反馈闭环专项：真实用户负反馈问题（无金标准参考）→ 检索诊断 + LLM 质量判断。
+
+    口径说明：Hit@k 需要 doc↔reference 余弦对比，反馈问题没有金标准，
+    用「逐条检索命中诊断 + faithfulness/relevancy」代替——看真实不满意的样本
+    是检索没找到（检索侧问题）还是生成不对（生成侧问题），据此决定改哪一环。
+    """
+    scores = {"faithfulness": 0, "answer_relevancy": 0}
+    total = len(df)
+
+    for i, row in df.iterrows():
+        q = row["query"]
+        docs = retrieve(q)
+        top = docs[:3]
+        print(f"\n  [{i+1}/{total}] {q[:50]}")
+        for j, d in enumerate(top, 1):
+            name = d.metadata.get("动作名称") or d.metadata.get("source", "")
+            snip = d.page_content.replace("\n", " ")[:80]
+            print(f"      #{j} [{name}] {snip}")
+        parts = []
+        for doc in top:
+            name = doc.metadata.get("动作名称", "")
+            if name:
+                muscles = doc.metadata.get("目标肌群", "")
+                equip = doc.metadata.get("器械", "")
+                parts.append(f"[{name}] 肌群:{muscles} 器械:{equip}")
+            else:
+                parts.append(doc.page_content.replace("\n", " ")[:120])
+        ctx = "\n".join(parts)
+        answer = answer_chain.invoke({"question": q, "context": ctx})
+        f = parse_score(faithfulness_chain.invoke({"context": ctx, "answer": answer}))
+        r = parse_score(relevancy_chain.invoke({"question": q, "answer": answer}))
+        scores["faithfulness"] += f
+        scores["answer_relevancy"] += r
+
+        if (i + 1) % 10 == 0:
+            print(f"  feedback... {i+1}/{total} (f={f} r={r})")
+            gc.collect()
+            time.sleep(1.0)
+
+    return {k: round(v / total, 4) for k, v in scores.items()}
+
+
 # -- 3) 按题型分组 -----------------------------------------
 def compute_by_type(retrieval_scores_func):
     """返回每种 question_type 的 Hit@3 和 MRR"""
@@ -321,6 +389,19 @@ def validate_classifier():
 
 # -- 执行 --------------------------------------------------
 print(f"\n[INFO] 评测模式: {EVAL_MODE}")
+
+# 反馈闭环模式：只跑反馈专项（无金标准 → 不跑 Hit@k / 分组 / 分类器验证）
+if USE_FEEDBACK:
+    t_start = time.time()
+    print("\n[1/1] 反馈专项：逐条检索诊断 + faithfulness/relevancy（LLM-judge）...")
+    fb_scores = compute_feedback_report()
+    print("\n" + "=" * 70)
+    print("                [RESULTS] 负反馈样本质量报告")
+    print("=" * 70)
+    print(f"\n  {'faithfulness (忠实度)':<28} {fb_scores['faithfulness']:>8.4f}")
+    print(f"  {'answer_relevancy (相关性)':<28} {fb_scores['answer_relevancy']:>8.4f}")
+    print(f"\n  [TIME] 总耗时: {time.time()-t_start:.1f}s (模式: {EVAL_MODE} / 反馈闭环)")
+    sys.exit(0)
 
 # 分类器验证（HyDE 模式时输出详情）
 if USE_HYDE:
