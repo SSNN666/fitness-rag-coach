@@ -225,7 +225,7 @@ if nav == "💬 智能问答":
                         request_id = data.get("request_id", "")
                     elif event == "status":
                         # 流水线阶段进度（生成前的等待期反馈；delta 到来后覆盖）
-                        holder.markdown(f"🔄 {data.get('stage', '处理中…')} ▌")
+                        holder.markdown(f"🔄 {data.get('stage', '处理中…')}")
                     elif event == "delta":
                         answer_parts.append(data.get("text", ""))
                         # 前端节流：每个 delta 都更新 placeholder 会高频替换 DOM 节点，
@@ -235,11 +235,11 @@ if nav == "💬 智能问答":
                         now = time.time()
                         if now - last_render >= 0.15:
                             last_render = now
-                            holder.markdown("".join(answer_parts) + " ▌")
+                            holder.markdown("".join(answer_parts))
                     elif event == "answer":
                         # 权威全文(事实核查/硬过滤/审核后的最终文本)→ 覆盖增量区
                         answer_parts = [data.get("text", "")]
-                        holder.markdown(data.get("text", "") + " ▌")
+                        holder.markdown(data.get("text", ""))
                     elif event == "citations":
                         citations = data.get("docs", [])
                         refusal = data.get("refusal", False)
