@@ -14,6 +14,7 @@ app.py —— Streamlit SSE 客户端（康养 Demo 重构）
 """
 
 import json
+import time
 
 import httpx
 import streamlit as st
@@ -215,6 +216,7 @@ if nav == "💬 智能问答":
             error_msg: str | None = None
             banner_msg: str | None = None
             request_id: str = ""   # meta 帧携带；反馈/检索详情按此关联
+            last_render = 0.0      # placeholder 更新节流（removeChild 竞态防护）
 
             try:
                 for event, data in _stream_events(prompt_input, SESSION_ID):
@@ -226,7 +228,14 @@ if nav == "💬 智能问答":
                         holder.markdown(f"🔄 {data.get('stage', '处理中…')} ▌")
                     elif event == "delta":
                         answer_parts.append(data.get("text", ""))
-                        holder.markdown("".join(answer_parts) + " ▌")
+                        # 前端节流：每个 delta 都更新 placeholder 会高频替换 DOM 节点，
+                        # 触发 Streamlit 已知 removeChild 竞态（plan 层长流式 2048 token
+                        # 尤为高频）→ 每 ≥150ms 才刷新一次；流结束后的 holder.markdown(final)
+                        # 保证最终文本完整展示，节流不影响结果
+                        now = time.time()
+                        if now - last_render >= 0.15:
+                            last_render = now
+                            holder.markdown("".join(answer_parts) + " ▌")
                     elif event == "answer":
                         # 权威全文(事实核查/硬过滤/审核后的最终文本)→ 覆盖增量区
                         answer_parts = [data.get("text", "")]
