@@ -382,8 +382,10 @@ class PipelineService:
             if contra_text and "暂无" not in contra_text and "无需" not in contra_text:
                 ctx = contra_text + "\n" + ctx
 
+            # 传入实际激活的供应商：令牌预算按其上下文窗口取值（而非恒按本地 8192）
             ctx = self._gateway.guard_token_budget(
-                system_prompt, self._store, session_id, ctx, question)
+                system_prompt, self._store, session_id, ctx, question,
+                provider=self._active_provider(tier_cfg))
 
             # 缓存快速路径：同问题同模式已校验过的回答直接复用（跳过生成，省 LLM 调用）
             if self._needs_fact_check(question) and self._fact_cache is not None:
@@ -766,6 +768,16 @@ class PipelineService:
             import hashlib
             names.append(f"profile:{hashlib.md5(user_profile.encode('utf-8')).hexdigest()[:8]}")
         return names
+
+    def _active_provider(self, tier_cfg: dict) -> str | None:
+        """解析当前层实际会使用的供应商（降级链首位）。
+
+        与生成阶段的选型同一口径（`_llms.get(tier_cfg["role"])`），供令牌预算决定
+        上下文窗口大小。取不到/无适配器时返回 None → 网关回退本地配置。
+        """
+        llm = self._llms.get(tier_cfg.get("role", "")) or self._llms.get("chat")
+        providers = getattr(llm, "active_providers", None)
+        return providers[0] if providers else None
 
     def _run_fact_check(self, question: str, answer: str, context: str,
                         contraindications: str, forbidden_actions: list[str],

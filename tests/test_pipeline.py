@@ -171,7 +171,8 @@ class _FakeGateway:
     def log_prompt(self, *a, **k): pass
     def log_answer(self, *a, **k): pass
     def log_usage(self, *a, **k): pass
-    def guard_token_budget(self, system_prompt, history, session_id, ctx, query):
+    def guard_token_budget(self, system_prompt, history, session_id, ctx, query,
+                           provider=None):
         return ctx
     def get_active_llm(self, llm): return llm
 

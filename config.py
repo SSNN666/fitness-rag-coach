@@ -303,6 +303,17 @@ LLM_LOCAL_TIMEOUT = 300.0               # 本地 Ollama 超时（CPU 推理慢�
 LLM_MAX_RETRIES = 2                     # 单供应商内可重试次数（额度不足/鉴权/上下文超长不盲目重试）
 LLM_RETRY_BACKOFF = (1.0, 2.0)          # 重试退避秒数
 
+# 各供应商的上下文窗口（tokens）
+# ⚠️ 令牌预算必须按**实际激活的供应商**取值。原实现恒用 OLLAMA_NUM_CTX(=8192)，
+#    云端主链（qwen3.7 128k）可用上下文被白扔 16 倍——上下文预算只有 4505 tokens。
+#    本地 Ollama 仍按其服务端配置（OLLAMA_CONTEXT_LENGTH）。
+LLM_CONTEXT_WINDOWS = {
+    "dashscope": 131072,        # qwen3.7-plus / flash（MaaS 私有部署按实际型号调整）
+    "deepseek": 65536,          # deepseek-chat
+    "qianfan": 131072,          # ernie-4.5-turbo-128k
+    "ollama": OLLAMA_NUM_CTX,   # 本地模型：与服务端 OLLAMA_CONTEXT_LENGTH 保持一致
+}
+
 # 角色 → 各供应商模型映射 + 生成参数（vision 仅 qwen3-vl-plus：VL 只做图像理解，本地无 VL → 云失败返回明确提示）
 # 注：私有 MaaS 部署无 qwen-plus 公共型号，按 models.list() 实际可用名映射
 # thinking: 混合思考开关（仅 DashScope 生效）。qwen3.7 默认思考模式极慢（实测 8.4s vs 0.5s），

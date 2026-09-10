@@ -360,6 +360,22 @@ class _TokenBudgetGuard:
         self._cfg = cfg
         self._log = logger
 
+    def _resolve_ctx_window(self, provider: str | None) -> int:
+        """按**实际激活的供应商**取上下文窗口；未知/None 回退本地配置。
+
+        原实现恒用 ollama_num_ctx（8192），云端主链（128k）的上下文预算只有 4505
+        tokens，等于把可用窗口白扔 16 倍。见 config.LLM_CONTEXT_WINDOWS。
+        """
+        if provider and provider != "ollama":
+            try:
+                from config import LLM_CONTEXT_WINDOWS
+                win = LLM_CONTEXT_WINDOWS.get(provider)
+                if win:
+                    return int(win)
+            except Exception:
+                pass
+        return int(self._cfg.ollama_num_ctx)
+
     def guard(
         self,
         system_prompt: str,
@@ -367,17 +383,20 @@ class _TokenBudgetGuard:
         session_id: str,
         context: str,
         query: str,
+        provider: str | None = None,
     ) -> tuple[str, dict | None]:
         """
         级联截断，返回 (safe_context, budget_info | None)。
 
+        provider：当前实际激活的供应商（如 "dashscope"）；None → 按本地配置估算。
         budget_info 包含 before/after 令牌数，供 UI 展示。
         """
         if not self._cfg.token_budget_enabled:
             return context, None
 
         try:
-            budget = int(self._cfg.ollama_num_ctx * self._cfg.token_budget_ratio)
+            budget = int(self._resolve_ctx_window(provider)
+                         * self._cfg.token_budget_ratio)
             sys_tokens = _estimate_tokens(system_prompt)
             q_tokens = _estimate_tokens(query)
             hist_tokens = self._estimate_history(history_store, session_id)
@@ -629,16 +648,18 @@ class Gateway:
         session_id: str,
         context: str,
         query: str,
+        provider: str | None = None,
     ) -> str:
         """
         级联截断 → 返回安全 context。
         history_store 应为会话 store（_SessionHistory 字典，与 langchain ChatMessageHistory 接口兼容）。
+        provider: 当前实际激活的供应商，决定上下文预算（见 _TokenBudgetGuard._resolve_ctx_window）。
         内部可能裁剪 history_store 中的消息。
         """
         if not self._cfg.enabled:
             return context
         safe_ctx, budget_info = self._token_guard.guard(
-            system_prompt, history_store, session_id, context, query
+            system_prompt, history_store, session_id, context, query, provider
         )
         self._last_budget_info = budget_info
         return safe_ctx
