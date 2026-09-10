@@ -130,7 +130,7 @@ function renderCase(c, idx){
     <div class="case-head">
       <p class="q">${idx}. ${esc(c.question)}</p>
       <div class="meta">${pills}</div>
-      <div class="hl">💡 ${esc(c.highlight || '')}</div>
+      <div class="hl">💡 ${render(c.highlight || '')}</div>
     </div>
     <div class="body">
       <div class="answer">${render(c.answer)}</div>
