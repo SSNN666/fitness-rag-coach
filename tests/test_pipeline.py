@@ -332,7 +332,10 @@ class _SearchableRetriever:
     def get_contraindications(self, names):
         return {}
 
-    def search_with_scores(self, query, k=3, use_rerank=False):
+    def search_with_scores(self, query, k=3, use_rerank=False, query_vec=None):
+        # query_vec：真实实现在锁外用传入向量免一次 embedding；桩只记录 query，
+        # 但**签名必须一致**——否则 TypeError 会被流水线的检索兜底吞掉，
+        # 表现为 seen_queries 为空（看起来像「检索没跑」，其实是调用签名不匹配）。
         self.seen_queries.append(query)
         from langchain_core.documents import Document
         doc = Document(
@@ -785,3 +788,71 @@ def test_reranker_llm_has_usage_callback():
     m = [ln for ln in src.splitlines() if 'build_llm("rerank"' in ln]
     assert m, "没找到 rerank 的构建语句"
     assert "on_usage" in m[0], f"rerank 仍未挂记账回调: {m[0].strip()}"
+
+
+# ================================================================
+# query embedding 必须在锁外算（延迟关键路径）
+# ================================================================
+#
+# 云端 embedding 是一次网络往返（实测中位 158ms、最坏 800ms+）。它原先在
+# search_with_scores 内部现算，而该函数在全局锁内被调用 → 所有并发请求的
+# 检索段排队等这一次 HTTP。
+# 实测（真实服务 + 真实 embedding）：
+#   simple 层 C_retrieve 持有 161ms → 57ms（−65%），锁内 embedding 1 次 → 0 次
+#   并发 32：锁等待 5461ms → 1134ms，吞吐 878 → 1682 tok/s
+
+def test_query_embedding_happens_outside_lock(monkeypatch):
+    """回归：embedding 不得发生在全局锁内——否则并发时所有请求排队等 HTTP。"""
+    import pipeline as pipeline_mod
+    monkeypatch.setattr(pipeline_mod, "REFUSE_ENABLED", False)
+    monkeypatch.setattr(pipeline_mod, "CRAG_ENABLED", False)
+
+    stop = threading.Event()
+    retriever = _SearchableRetriever()
+    svc = PipelineService(
+        retriever=retriever,
+        llms={"hyde": _SpyChain(stop), "chat_fast": _SpyChain(stop),
+              "chat": _SpyChain(stop)},
+        gateway=_FakeGateway(), fact_engine=None, fact_cache=None, store={})
+
+    in_lock, total = [], []
+    orig = retriever._embed
+
+    def spy(text):
+        total.append(text)
+        if svc._lock.locked():
+            in_lock.append(text)
+        return orig(text)
+
+    retriever._embed = spy
+    svc.answer("深蹲练什么肌肉")
+
+    assert total, "整个请求一次 embedding 都没发生？用例前提失效"
+    assert in_lock == [], f"这些 embedding 发生在锁内：{in_lock}"
+
+
+def test_precomputed_vec_reaches_retrieval(monkeypatch):
+    """预算出的向量要真的传到检索手里（否则会退化成「算两次」）。"""
+    import pipeline as pipeline_mod
+    monkeypatch.setattr(pipeline_mod, "REFUSE_ENABLED", False)
+    monkeypatch.setattr(pipeline_mod, "CRAG_ENABLED", False)
+
+    stop = threading.Event()
+    retriever = _SearchableRetriever()
+    seen: list = []
+    orig = retriever.search_with_scores
+
+    def spy(query, k=3, use_rerank=False, query_vec=None):
+        seen.append(query_vec)
+        return orig(query, k=k, use_rerank=use_rerank)
+
+    retriever.search_with_scores = spy
+    svc = PipelineService(
+        retriever=retriever,
+        llms={"hyde": _SpyChain(stop), "chat_fast": _SpyChain(stop),
+              "chat": _SpyChain(stop)},
+        gateway=_FakeGateway(), fact_engine=None, fact_cache=None, store={})
+    svc.answer("深蹲练什么肌肉")
+
+    assert seen and seen[0] is not None, "检索没收到预算好的 query_vec"
+    assert seen[0] == [0.1] * 768

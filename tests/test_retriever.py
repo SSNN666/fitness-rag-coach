@@ -127,3 +127,49 @@ def test_semantic_dedup_on_embeds_and_dedups(monkeypatch):
     docs = [(Document(page_content=f"d{i}", metadata={}), 0.5) for i in range(5)]
     out = r._weighted_fusion([docs, [], []], [1.0, 0.0, 0.0], top_k=None)
     assert len(out) == 3        # 5 条两两相似 → 只保留 FUSION_MIN_DOCS 条
+
+
+# ----------------------------------------------------------------
+# 传入预算好的 query 向量：锁外 embedding（延迟关键路径）
+# ----------------------------------------------------------------
+#
+# 背景：云端 embedding 是一次网络往返（实测中位 158ms、最坏 800ms+）。原实现
+# 在 search_with_scores 内部现算，而该函数在全局锁内被调用 → 所有并发请求的
+# 检索段排队等这一次 HTTP（实测 simple 层 C_retrieve 持有时长的 ~68% 是它）。
+# 现在调用方可在锁外算好、传 query_vec 进来。
+
+def _retriever_with(embed, monkeypatch):
+    import config as cfg
+    monkeypatch.setattr(cfg, "FUSION_SEMANTIC_DEDUP_ENABLED", False)
+    return FitnessRAGRetriever(
+        milvus_client=_FakeMilvus(),
+        bm25_index=(_FakeBM25(), [Document(page_content="x")]),
+        neo4j_driver=None, embedding_fn=embed, fusion_threshold=0.0)
+
+
+def test_query_vec_skips_embedding(monkeypatch):
+    """传了 query_vec 就不该再调 embedding——否则「移出锁」等于没做。"""
+    calls = []
+    r = _retriever_with(lambda t: (calls.append(t), [0.1, 0.2, 0.3])[1], monkeypatch)
+    r.search_with_scores("深蹲", k=1, query_vec=[0.5, 0.6, 0.7])
+    assert calls == [], f"不应触发 embedding，实际调了 {calls}"
+    assert r._last_query_embedding == [0.5, 0.6, 0.7]   # 缓存仍需写入（grounding 复用）
+    assert r._milvus.seen == [[0.5, 0.6, 0.7]]          # 检索用的是传入向量
+
+
+def test_query_vec_none_falls_back_to_embedding(monkeypatch):
+    """不传时退回原行为——旧调用方（MCP / eval / demo）不受影响。"""
+    calls = []
+    r = _retriever_with(lambda t: (calls.append(t), [0.1, 0.2, 0.3])[1], monkeypatch)
+    r.search_with_scores("深蹲", k=1)
+    assert calls == ["深蹲"]
+
+
+def test_query_vec_not_used_when_retrieval_degraded(monkeypatch):
+    """稀疏降级模式下不走向量检索，也不该把传入向量写进缓存（与原有语义一致）。"""
+    calls = []
+    r = _retriever_with(lambda t: (calls.append(t), [0.1])[1], monkeypatch)
+    r.set_degraded(True)
+    r.search_with_scores("深蹲", k=1, query_vec=[0.5, 0.6, 0.7])
+    assert calls == []
+    assert r._last_query_embedding is None

@@ -246,6 +246,20 @@ class PipelineService:
                 drafts = None
                 self._gateway.log_cycle("hyde_gen_error", request_id=rid,
                                         error=str(e)[:200])
+        # query 向量在**锁外**预算：云端 embedding 是一次网络往返（实测中位 158ms、
+        # 最坏 800ms+）。放在锁内等于让所有并发请求的检索段排队等这一次 HTTP——
+        # 实测 simple 层 C_retrieve 持有时长的 ~68% 就是它。
+        # 放在这里（与 HyDE 同段，都是网络调用、无共享状态）不改变依赖顺序：
+        # 检索要用的是 retrieval_q，此时已定稿。
+        precomputed_vec = None
+        if not self._cancelled(stop_event):
+            try:
+                precomputed_vec = self._retriever._embed(retrieval_q)
+            except Exception as e:
+                # 预算失败不致命：检索侧会自行补算（退回原行为），只是慢一点
+                self._gateway.log_cycle("embed_precompute_error", request_id=rid,
+                                        error=str(e)[:120])
+
         if self._cancelled(stop_event):
             return result
 
@@ -286,7 +300,8 @@ class PipelineService:
                 retr_k = RERANKER_MAX_CANDIDATES if tier_cfg["rerank"] \
                     else tier_cfg.get("context_docs", CONTEXT_DOCS_MAX)
                 scored_docs = self._retriever.search_with_scores(
-                    retrieval_q, k=retr_k, use_rerank=False)
+                    retrieval_q, k=retr_k, use_rerank=False,
+                    query_vec=precomputed_vec)   # 锁外算好的向量，锁内直接用
                 if not drafts:
                     # 直查路径：search_with_scores 结果即引用来源（simple 层跳过 HyDE 后
                     # 不再单独 invoke 重复检索——原实现同 query 同 k 搜了两次）

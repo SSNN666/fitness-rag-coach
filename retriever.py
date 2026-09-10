@@ -193,13 +193,19 @@ class FitnessRAGRetriever:
         return {rec["injury"]: rec["forbidden"] for rec in records}
 
     def search_with_scores(self, query: str, k: int = 3,
-                           use_rerank: bool | None = None) -> list[tuple[Document, float]]:
+                           use_rerank: bool | None = None,
+                           query_vec: list[float] | None = None
+                           ) -> list[tuple[Document, float]]:
         """
         三路独立检索 + 动态权重融合（网关路由） + 去噪去重 + (可选) LLM 重排序。
 
         Args:
             use_rerank: None=按是否配置 reranker 自动；False=本查询跳过 LLM 重排
                         （分层生成策略：simple 查询跳过重排省时）
+            query_vec: 已算好的 query 向量。**调用方在锁外预算好再传进来**——
+                       云端 embedding 是一次网络往返（实测中位 158ms、最坏 800ms+），
+                       放在锁内等于让所有并发请求的检索段排队等这一次 HTTP。
+                       为 None 时退回原行为（内部自行 embedding），保持向后兼容。
 
         Returns:
             [(Document, final_score), ...] 按得分降序
@@ -211,7 +217,9 @@ class FitnessRAGRetriever:
             self._last_query_embedding = None   # 稀疏模式不计算向量
         else:
             # query 向量只嵌入一次：检索 + grounding 相关性判定复用（见 _last_query_embedding 注释）
-            query_vec = self._embed(query)
+            # 调用方已预算好则直接用（锁外算的，见 query_vec 参数说明）；否则就地补算（兼容旧调用方）
+            if query_vec is None:
+                query_vec = self._embed(query)
             self._last_query_embedding = query_vec
             milvus_results = self._search_milvus_with_vec(query_vec, k * self.milvus_factor)
             neo4j_results = self._search_neo4j(query, k * self.neo4j_factor)
