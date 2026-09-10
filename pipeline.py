@@ -26,8 +26,10 @@ Streamlit 应用重构为 SSE 客户端后，原 app.py 的 Phase 1 流水线迁
 
 from __future__ import annotations
 
+import contextlib
 import re
 import threading
+import time
 import uuid
 from dataclasses import dataclass, field
 
@@ -169,7 +171,7 @@ class PipelineService:
         result = PipelineResult(request_id=rid)
 
         # ===== 阶段 A（锁内）：实体 → 禁忌 → 边界拒绝 → 分层（纯本地，无 LLM/网络）=====
-        with self._lock:
+        with self._phase_lock(rid, "A_analyze"):
             self._stage(on_stage, "正在分析问题与禁忌约束…")
             entities = FitnessRAGRetriever._extract_entities(question)
             injury_names = entities.get("injury", [])
@@ -200,8 +202,7 @@ class PipelineService:
             # 若在生成时才改，缓存 key 会声明思考态而实际没思考 → 跨模式串答案。
             if deep_thinking and self._gateway.cost_state == COST_DEGRADED:
                 deep_thinking = False
-                self._gateway.log_cycle("info", request_id=rid,
-                                        event_detail="cost_degraded_deep_thinking_off")
+                self._gateway.log_cycle("cost_degraded_deep_thinking_off", request_id=rid)
 
             # 深度思考开关（用户自选）：复杂层默认快速（plus 关思考），开启后切 chat（思考开）+ 长预算
             if deep_thinking and tier in ("injury", "plan"):
@@ -243,7 +244,7 @@ class PipelineService:
                 drafts = generate_hyde_drafts(retrieval_q, self._llms["hyde"])
             except Exception as e:
                 drafts = None
-                self._gateway.log_cycle("error", request_id=rid, event_detail="hyde_gen_error",
+                self._gateway.log_cycle("hyde_gen_error", request_id=rid,
                                         error=str(e)[:200])
         if self._cancelled(stop_event):
             return result
@@ -257,12 +258,11 @@ class PipelineService:
                 low = avail < RETRIEVAL_MEMORY_THRESHOLD_GB
                 self._retriever.set_degraded(low)
                 if low:
-                    self._gateway.log_cycle("warning", request_id=rid,
-                                            event_detail="retrieval_degraded_sparse_only",
+                    self._gateway.log_cycle("retrieval_degraded_sparse_only", request_id=rid,
                                             avail_gb=round(avail, 2))
             except Exception:
                 pass   # 内存检测失败不影响主链路
-        with self._lock:
+        with self._phase_lock(rid, "C_retrieve"):
             # 多轮改写复查：改写补充了伤病实体 → 补查禁忌 + 重跑边界拒绝
             # （Phase A 按原问题实体放行；此处用改写后合并实体重新上安全闸门）
             if do_rewrite and injury_names != phase_a_injuries:
@@ -297,7 +297,7 @@ class PipelineService:
                 q_emb = self._retriever._last_query_embedding
             except Exception as e:
                 ctx, cite_docs, scored_docs, q_emb = "", [], [], None
-                self._gateway.log_cycle("error", request_id=rid, event_detail="retrieval_error",
+                self._gateway.log_cycle("retrieval_error", request_id=rid,
                                         error=str(e)[:200])
             # 记录实际检索用 query（改写场景可审计原始 vs 改写后）
             self._gateway.log_retrieval(rid, retrieval_q, self._docs_to_log(scored_docs))
@@ -388,7 +388,7 @@ class PipelineService:
             return result
 
         # ===== 阶段 E（锁内）：Prompt 组装 + 令牌预算（裁剪 store）+ 缓存快速路径 =====
-        with self._lock:
+        with self._phase_lock(rid, "E_budget"):
             # 工具计算结果注入上下文顶部
             # （位于令牌预算守卫之前：头部位置不会被尾部截断误伤）
             if tool_results:
@@ -465,6 +465,32 @@ class PipelineService:
     # ----------------------------------------------------------------
     # 各步骤实现（自 app.py 迁移，session_state → 实例/参数）
     # ----------------------------------------------------------------
+
+    @contextlib.contextmanager
+    def _phase_lock(self, rid: str, phase: str):
+        """获取全局锁，并记录**等待**与**持有**时长。
+
+        为什么分别记两个数：等待时长是「串行化程度」的直接证据，持有时长是「临界区
+        本身多长」。并发升高时——
+          等待↑、持有→  ⇒ 瓶颈就是这把锁（要拆锁/外置）
+          两者都→      ⇒ 瓶颈不在这里，分布式锁/Redis 解决不了任何问题
+        只看总延迟是分不出这两者的，这正是压测归因要回答的问题。
+        """
+        t0 = time.perf_counter()
+        self._lock.acquire()
+        wait_ms = (time.perf_counter() - t0) * 1000.0
+        t1 = time.perf_counter()
+        try:
+            yield
+        finally:
+            hold_ms = (time.perf_counter() - t1) * 1000.0
+            self._lock.release()
+            # 纯度量埋点不得成为硬依赖：gateway 为 None 时静默跳过。
+            # 否则「没传 gateway 的轻量构造」会因为一行日志而崩，而这条路径原本不碰网关。
+            if self._gateway is not None:
+                self._gateway.log_cycle("lock_phase", request_id=rid, phase=phase,
+                                        wait_ms=round(wait_ms, 1),
+                                        hold_ms=round(hold_ms, 1))
 
     def _generate(self, gen: dict, rid: str, result: PipelineResult) -> PipelineResult:
         """阶段二（锁外）：降级链生成 → 硬过滤 → Fact-Check → 引用 → 写历史。
@@ -571,7 +597,7 @@ class PipelineService:
         result.answer = answer
 
         # 会话历史写回（重新获取锁；注入检测等阻断路径不写）
-        with self._lock:
+        with self._phase_lock(rid, "F_history"):
             self._append_history(session_id, question, answer)
             self._gateway.log_answer(rid, answer)
         return result

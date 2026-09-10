@@ -813,7 +813,15 @@ class Gateway:
     # ---- Hook 4: 结构化日志 ----
 
     def log_cycle(self, event: str, **kwargs):
-        """记录一次请求周期的结构化日志。"""
+        """记录一次请求周期的结构化日志。
+
+        约定：**第一个参数是事件名**（写入日志的 `event` 字段），不是日志级别——
+        级别固定为 INFO（要分级请用 _StructuredLogger 的 debug/warning/error）。
+
+        ⚠️ 曾有 4 处调用点误把 "info"/"error"/"warning" 当作第一个参数传进来，
+        真实事件名塞在 `event_detail` 里 → 日志里出现 `event: "error"` 这种条目，
+        `grep 'event=="retrieval_error"'` 一条都搜不到。实测排查成本上限降级时被此坑到。
+        """
         if not self._cfg.enabled:
             return
         _slog(self._log, 'info', event, **kwargs)

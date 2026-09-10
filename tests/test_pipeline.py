@@ -644,3 +644,94 @@ def test_cost_degraded_keeps_safety_and_retrieval(monkeypatch):
     # 伤病类仍然被识别并拦截（禁忌判定没有因为省钱被跳过）
     assert result.refusal is True
     assert "深蹲" in result.answer
+
+
+# ================================================================
+# 锁埋点（压测归因用）：等待/持有分别记录，且不得改变互斥语义
+# ================================================================
+#
+# 背景：只看总延迟分不出「锁是瓶颈」和「锁无辜」，必须分别记「等待」与「持有」。
+# 埋点本身是纯度量 —— 它不能改变被度量代码的行为，这组用例守的就是这条线。
+
+class _RecordingGateway(_FakeGateway):
+    """记录 log_cycle 调用，便于断言埋点写了什么。"""
+
+    def __init__(self):
+        self.events: list = []
+
+    def log_cycle(self, event, **kw):
+        self.events.append((event, kw))
+
+
+def _svc_with(gateway):
+    return PipelineService(retriever=None, llms=None, gateway=gateway, store={})
+
+
+def test_phase_lock_records_phase_wait_and_hold():
+    gw = _RecordingGateway()
+    svc = _svc_with(gw)
+    with svc._phase_lock("rid-1", "C_retrieve"):
+        pass
+    hits = [e for e in gw.events if e[0] == "lock_phase"]
+    assert len(hits) == 1                      # 进入一次 = 记一条（不是两条）
+    _, kw = hits[0]
+    assert kw["phase"] == "C_retrieve"
+    assert kw["request_id"] == "rid-1"
+    assert kw["wait_ms"] >= 0 and kw["hold_ms"] >= 0
+
+
+def test_phase_lock_measures_contention():
+    """被占用时确实记到等待时间——否则「锁等待」这一列永远是 0，归因就是假的。"""
+    gw = _RecordingGateway()
+    svc = _svc_with(gw)
+    svc._lock.acquire()                        # 人为占住
+    holder = threading.Timer(0.15, svc._lock.release)
+    holder.start()
+    with svc._phase_lock("rid-2", "A_analyze"):
+        pass
+    holder.join()
+    kw = [e[1] for e in gw.events if e[0] == "lock_phase"][0]
+    assert kw["wait_ms"] >= 100, f"等待应被记到，实际 {kw['wait_ms']}ms"
+    assert kw["hold_ms"] < 100, f"持有不该含等待，实际 {kw['hold_ms']}ms"
+
+
+def test_phase_lock_still_mutually_exclusive():
+    """埋点不能破坏原有的互斥语义（换成 contextmanager 时最容易踩的坑）。"""
+    import time as _t
+    svc = _svc_with(None)
+    inside: list = []
+    overlap: list = []
+
+    def worker():
+        with svc._phase_lock("r", "X"):
+            inside.append(1)
+            if len(inside) > 1:
+                overlap.append(len(inside))
+            _t.sleep(0.03)
+            inside.pop()
+
+    ts = [threading.Thread(target=worker) for _ in range(4)]
+    for t in ts:
+        t.start()
+    for t in ts:
+        t.join()
+    assert overlap == [], "有线程同时进入了临界区"
+
+
+def test_phase_lock_releases_on_exception():
+    """临界区抛异常也必须释放锁——否则一次异常就把整个服务锁死。"""
+    svc = _svc_with(None)
+    try:
+        with svc._phase_lock("r", "X"):
+            raise ValueError("boom")
+    except ValueError:
+        pass
+    assert svc._lock.acquire(timeout=1.0), "异常路径未释放锁"
+    svc._lock.release()
+
+
+def test_phase_lock_tolerates_missing_gateway():
+    """纯度量埋点不得变成硬依赖：gateway=None 时静默跳过而非崩。"""
+    svc = _svc_with(None)
+    with svc._phase_lock("r", "X"):
+        pass
