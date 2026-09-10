@@ -1,0 +1,161 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>康养知识库 RAG 问答系统 —— 演示快照</title>
+<style>
+  :root{
+    --bg:#0f1115; --panel:#171a21; --panel2:#1e222b; --line:#2a2f3a;
+    --fg:#e6e9ef; --muted:#9aa3b2; --accent:#4f9cf9; --ok:#3fb950;
+    --warn:#d29922; --err:#f85149; --pill:#232833;
+  }
+  *{box-sizing:border-box}
+  body{margin:0;background:var(--bg);color:var(--fg);
+       font:15px/1.7 -apple-system,"Segoe UI","Microsoft YaHei",sans-serif}
+  .wrap{max-width:1000px;margin:0 auto;padding:32px 20px 80px}
+  header{border-bottom:1px solid var(--line);padding-bottom:20px;margin-bottom:24px}
+  h1{font-size:24px;margin:0 0 8px}
+  .sub{color:var(--muted);font-size:14px}
+  .banner{margin:16px 0;padding:12px 16px;border-radius:8px;
+          background:rgba(210,153,34,.1);border:1px solid rgba(210,153,34,.35);
+          color:#e8c97a;font-size:13.5px}
+  .case{background:var(--panel);border:1px solid var(--line);border-radius:12px;
+        margin:18px 0;overflow:hidden}
+  .case-head{padding:16px 20px;background:var(--panel2);border-bottom:1px solid var(--line)}
+  .q{font-size:16px;font-weight:600;margin:0 0 8px}
+  .meta{display:flex;gap:8px;flex-wrap:wrap;align-items:center;font-size:12.5px}
+  .pill{background:var(--pill);border:1px solid var(--line);border-radius:999px;
+        padding:2px 10px;color:var(--muted)}
+  .pill.ref{color:#ffb4b4;border-color:rgba(248,81,73,.4);background:rgba(248,81,73,.1)}
+  .pill.grd{color:#a8e6b0;border-color:rgba(63,185,80,.35);background:rgba(63,185,80,.1)}
+  .hl{color:var(--muted);font-size:13px;margin-top:8px}
+  .body{padding:18px 20px}
+  .answer{white-space:pre-wrap;word-break:break-word}
+  .answer b{color:#fff}
+  section{margin-top:16px;border-top:1px dashed var(--line);padding-top:14px}
+  summary{cursor:pointer;color:var(--accent);font-size:13.5px;user-select:none}
+  summary::marker{color:var(--muted)}
+  .cite{background:var(--panel2);border-left:3px solid var(--accent);
+        border-radius:0 6px 6px 0;padding:10px 12px;margin:8px 0;font-size:13.5px}
+  .cite .src{color:var(--muted);font-size:12.5px;margin-bottom:4px}
+  .cite.tool{border-left-color:var(--ok)}
+  .cite.web{border-left-color:var(--warn)}
+  .doc{font-size:13px;color:var(--muted);padding:6px 0;border-bottom:1px solid var(--line)}
+  .doc:last-child{border-bottom:none}
+  .doc .score{color:var(--accent);font-variant-numeric:tabular-nums}
+  .stats{color:var(--muted);font-size:12.5px;margin-top:10px}
+  .toc a{color:var(--accent);text-decoration:none;font-size:13.5px;
+         display:block;padding:4px 0}
+  .toc a:hover{text-decoration:underline}
+  footer{margin-top:40px;padding-top:20px;border-top:1px solid var(--line);
+         color:var(--muted);font-size:13px}
+  code{background:var(--pill);padding:1px 6px;border-radius:4px;font-size:13px}
+</style>
+</head>
+<body>
+<div class="wrap">
+  <header>
+    <h1>🏋️ 康养知识库 RAG 问答系统</h1>
+    <div class="sub">
+      FastAPI 后端 + Streamlit SSE 客户端 ｜ 向量 + 关键词 + 图谱三路检索 ｜ 12 步安全流水线
+    </div>
+    <div class="banner">
+      ⚠️ <b>这是离线快照，不是实时服务。</b>
+      以下回答由完整管线真实跑出（含检索、重排、安全校验、事实核查），
+      导出为静态数据供在线浏览。实时版本需要 API Key 与向量库，不便公开部署。
+    </div>
+    <div class="toc" id="toc"></div>
+  </header>
+  <main id="app"></main>
+  <footer>
+    源码：<code>github.com/SSNN666/fitness-rag-coach</code> ｜
+    数据由 <code>build_demo.py</code> 生成 ｜
+    知识库来源为公开发布的官方健康科普资料，AI 输出不构成诊疗建议。
+  </footer>
+</div>
+
+<script>
+const esc = s => (s ?? '').replace(/[&<>"]/g, c =>
+  ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));
+
+// 极简 Markdown：加粗 / 行内代码 / 引用块（够用即可，不引外部库）
+function render(text){
+  let t = esc(text);
+  t = t.replace(/\*\*(.+?)\*\*/g, '<b>$1</b>');
+  t = t.replace(/`([^`]+)`/g, '<code>$1</code>');
+  return t;
+}
+
+function kindClass(kind){
+  if (kind === 'tool') return 'tool';
+  if (kind === 'web')  return 'web';
+  return '';
+}
+
+function renderCase(c, idx){
+  const pills = [
+    `<span class="pill">${esc(c.tag)}</span>`,
+    c.refusal
+      ? `<span class="pill ref">已拒答</span>`
+      : `<span class="pill grd">已作答</span>`,
+    c.fallback_active ? `<span class="pill ref">降级链生效</span>` : '',
+    c.profile ? `<span class="pill">画像：${esc(c.profile)}</span>` : ''
+  ].filter(Boolean).join('');
+
+  const cites = (c.citations || []).map(ct => `
+    <div class="cite ${kindClass(ct.kind)}">
+      <div class="src">${esc(ct.kind || 'kb')} ｜ ${esc(ct.source || '')}</div>
+      <div>${render(ct.snippet || ct.content || '')}</div>
+    </div>`).join('') || '<div class="doc">（无引用）</div>';
+
+  const docs = ((c.retrieval && c.retrieval.docs) || []).map(d => `
+    <div class="doc">
+      <span class="score">${(d.score ?? 0).toFixed ? d.score.toFixed(3) : d.score}</span>
+      ｜ ${esc(d.source || '')} ｜ ${esc((d.snippet || d.preview || d.text || '').slice(0, 90))}
+    </div>`).join('') || '<div class="doc">（无检索记录）</div>';
+
+  const q = c.retrieval && c.retrieval.query;
+  const rewritten = q && q !== c.question
+    ? `<div class="stats">检索实际使用的 query：<code>${esc(q)}</code>（与原问题不同 = 触发了改写）</div>`
+    : '';
+
+  return `
+  <article class="case" id="case-${idx}">
+    <div class="case-head">
+      <p class="q">${idx}. ${esc(c.question)}</p>
+      <div class="meta">${pills}</div>
+      <div class="hl">💡 ${esc(c.highlight || '')}</div>
+    </div>
+    <div class="body">
+      <div class="answer">${render(c.answer)}</div>
+      ${rewritten}
+      <div class="stats">回答 ${c.answer_len} 字 ｜ 引用 ${(c.citations||[]).length} 条</div>
+      <section>
+        <details><summary>📚 参考来源（${(c.citations||[]).length}）</summary>${cites}</details>
+      </section>
+      <section>
+        <details><summary>🔍 检索详情（三路融合后的来源与得分）</summary>${docs}</details>
+      </section>
+    </div>
+  </article>`;
+}
+
+fetch('demo_data.json')
+  .then(r => r.json())
+  .then(data => {
+    const cases = data.cases || [];
+    document.getElementById('toc').innerHTML =
+      cases.map((c,i) =>
+        `<a href="#case-${i+1}">${i+1}. [${esc(c.tag)}] ${esc(c.question)}</a>`).join('');
+    document.getElementById('app').innerHTML =
+      cases.map((c,i) => renderCase(c, i+1)).join('');
+  })
+  .catch(e => {
+    document.getElementById('app').innerHTML =
+      `<div class="banner">加载 demo_data.json 失败：${esc(String(e))}<br>
+       请先运行 <code>python build_demo.py</code> 生成数据，再打开本页面。</div>`;
+  });
+</script>
+</body>
+</html>
