@@ -1,6 +1,6 @@
 {
   "meta": {
-    "timestamp": "2026-09-10T22:16:40",
+    "timestamp": "2026-09-10T21:35:17",
     "eval_mode": "ThreePath",
     "provider": "dashscope",
     "fusion_mode": "weighted",
@@ -13,51 +13,16 @@
     "testset": "test_100_full.csv",
     "n_samples": 100,
     "git_commit": "42d147b",
-    "git_dirty": true,
-    "partial": false
+    "git_dirty": false,
+    "partial": true
   },
   "metrics": {
-    "Hit@1": 0.83,
+    "Hit@1": 0.82,
     "Hit@3": 0.91,
-    "Hit@5": 0.95,
-    "MRR": 0.8723,
-    "faithfulness": 0.51,
-    "answer_relevancy": 0.93,
-    "context_precision": 0.73,
-    "context_recall": 0.63
+    "Hit@5": 0.96,
+    "MRR": 0.8698
   },
-  "by_question_type": {
-    "基础问答": {
-      "n": 30,
-      "Hit@3": 1.0,
-      "MRR": 1.0
-    },
-    "动作纠错": {
-      "n": 10,
-      "Hit@3": 0.9,
-      "MRR": 0.9
-    },
-    "单伤病问答": {
-      "n": 25,
-      "Hit@3": 0.96,
-      "MRR": 0.96
-    },
-    "复合伤病问答": {
-      "n": 15,
-      "Hit@3": 1.0,
-      "MRR": 1.0
-    },
-    "计划生成": {
-      "n": 15,
-      "Hit@3": 0.6,
-      "MRR": 0.408
-    },
-    "定制长计划": {
-      "n": 5,
-      "Hit@3": 0.6,
-      "MRR": 0.45
-    }
-  },
+  "by_question_type": {},
   "samples": [
     {
       "query": "杠铃深蹲主要锻炼哪些肌群？正确的动作步骤和注意事项是什么？",
@@ -1196,9 +1161,9 @@
       "n_docs": 5,
       "retrieved_sources": [
         "neo4j",
+        "fitness_data.csv",
+        "fitness_data.csv",
         "neo4j",
-        "fitness_data.csv",
-        "fitness_data.csv",
         "neo4j"
       ]
     },
@@ -1244,17 +1209,15 @@
       "question_type": "单伤病问答",
       "hit_ranks": [
         1,
-        2,
-        3,
-        4
+        2
       ],
       "first_hit_rank": 1,
       "n_docs": 5,
       "retrieved_sources": [
         "neo4j",
         "neo4j",
-        "neo4j",
-        "neo4j",
+        "fitness_data.csv",
+        "fitness_data.csv",
         "fitness_data.csv"
       ]
     },
@@ -1436,8 +1399,7 @@
       "question_type": "复合伤病问答",
       "hit_ranks": [
         1,
-        2,
-        5
+        4
       ],
       "first_hit_rank": 1,
       "n_docs": 5,
@@ -1530,7 +1492,8 @@
       "hit_ranks": [
         1,
         2,
-        5
+        3,
+        4
       ],
       "first_hit_rank": 1,
       "n_docs": 5,
@@ -1677,7 +1640,6 @@
         1,
         2,
         3,
-        4,
         5
       ],
       "first_hit_rank": 1,
@@ -1776,8 +1738,10 @@
     {
       "query": "我是一名健身新手，想制定一份兼顾增肌与提升心肺功能的训练计划，请推荐包含特定动作的安排。",
       "question_type": "计划生成",
-      "hit_ranks": [],
-      "first_hit_rank": null,
+      "hit_ranks": [
+        4
+      ],
+      "first_hit_rank": 4,
       "n_docs": 4,
       "retrieved_sources": [
         "fitness_data.csv",
@@ -1790,16 +1754,15 @@
       "query": "我想制定一个增肌训练计划，请结合架上硬拉和坐姿三头肌下压，说明如何控制心率强度？",
       "question_type": "计划生成",
       "hit_ranks": [
-        1,
         2,
         3,
         4,
         5
       ],
-      "first_hit_rank": 1,
+      "first_hit_rank": 2,
       "n_docs": 5,
       "retrieved_sources": [
-        "全民健身指南（国家体育总局）",
+        "fitness_data.csv",
         "全民健身指南（国家体育总局）",
         "全民健身指南（国家体育总局）",
         "全民健身指南（国家体育总局）",

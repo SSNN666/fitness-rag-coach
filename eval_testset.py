@@ -151,6 +151,33 @@ SIM_THRESHOLD = 0.60
 SAMPLE_RECORDS: list[dict] = []
 
 
+def _git_state() -> tuple[str, bool]:
+    """返回 (commit, dirty)。dirty = 产生结果的代码与 commit 是否一致。
+
+    ⚠️ 必须排除 `eval_results/`：这个目录是**评测自己的输出**，而本函数在
+    写盘过程中被调用（先存中间结果、再存完整结果）——不排除的话，
+    上一次落盘的文件会被 `git status` 当成「工作区有改动」，
+    于是**每一次评测都会把自己标成 dirty**，这个标志就彻底失去意义了。
+
+    实测教训：21:43 那次评测标了 `git_dirty=True`，据此以为「结果对应的代码
+    在仓库里找不到」；实际工作区是干净的，是评测把自己的输出当成了改动。
+    """
+    import subprocess
+
+    try:
+        commit = subprocess.run(
+            ["git", "rev-parse", "--short", "HEAD"],
+            capture_output=True, text=True, timeout=5,
+        ).stdout.strip()
+        dirty = bool(subprocess.run(
+            ["git", "status", "--porcelain", "--", ".", ":(exclude)eval_results"],
+            capture_output=True, text=True, timeout=5,
+        ).stdout.strip())
+        return commit, dirty
+    except Exception:
+        return "", False
+
+
 def save_results(retrieval: dict, ragas_scores: dict, type_results: dict,
                  partial: bool = False) -> str:
     """把评测结果落盘 —— 让 README / 简历上的每个数字都可追溯、可复现。
@@ -163,23 +190,10 @@ def save_results(retrieval: dict, ragas_scores: dict, type_results: dict,
     不先存的话卡死会导致已完成的检索指标一起丢失。
     """
     import datetime
-    import subprocess
-
     out_dir = "eval_results"
     os.makedirs(out_dir, exist_ok=True)
 
-    try:
-        commit = subprocess.run(
-            ["git", "rev-parse", "--short", "HEAD"],
-            capture_output=True, text=True, timeout=5,
-        ).stdout.strip()
-        # 工作区有未提交改动时标注：否则 commit 号无法代表产生结果的代码
-        dirty = bool(subprocess.run(
-            ["git", "status", "--porcelain"],
-            capture_output=True, text=True, timeout=5,
-        ).stdout.strip())
-    except Exception:
-        commit, dirty = "", False
+    commit, dirty = _git_state()
 
     payload = {
         "meta": {
