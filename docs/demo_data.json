@@ -8,7 +8,7 @@
       "tag": "简单问答",
       "highlight": "分层策略：快模型 + 短预算 + 跳过重排，端到端约 2.5 秒（本机实测中位）",
       "profile": null,
-      "answer": "深蹲主要锻炼**股四头肌**和**臀大肌**。\n\n根据参考信息：\n1. **杠铃深蹲**：侧重股四头肌与臀大肌。\n2. **高脚杯深蹲 & 保加利亚分腿蹲**：除上述两肌群外，还能强化**核心**稳定性。\n\n建议根据自身水平选择动作，注意保持脊柱中立，避免受伤。",
+      "answer": "深蹲主要锻炼股四头肌和臀大肌。\n\n具体侧重如下：\n1. **杠铃深蹲**：主练股四头肌、臀大肌。\n2. **高脚杯深蹲**：兼顾股四头肌、臀大肌及核心。\n3. **保加利亚分腿蹲**：强化股四头肌、臀大肌及核心，提升单侧稳定性。\n\n建议根据目标选择合适动作。",
       "grounded": true,
       "refusal": false,
       "fallback_active": false,
@@ -31,12 +31,12 @@
       ],
       "usage": [
         {
-          "prompt_tokens": 540,
-          "completion_tokens": 89,
-          "total_tokens": 629,
+          "prompt_tokens": 463,
+          "completion_tokens": 99,
+          "total_tokens": 562,
           "model": "qwen3.7-flash",
           "provider": "dashscope",
-          "latency_ms": 1082
+          "latency_ms": 1309
         }
       ],
       "retrieval": {
@@ -45,13 +45,13 @@
           {
             "source": "fitness_data.csv",
             "page": null,
-            "score": 0.5353,
+            "score": 0.5352,
             "snippet": "动作名称: 杠铃深蹲 目标肌群: 股四头肌/臀大肌 器械: 杠铃 难度: 中 步骤: 1. 双脚与肩同宽 2. 杠铃置于斜方肌 3. 下蹲至大腿平行地面 4. 起身还原 注意事项: 膝盖不要超过脚尖过多 腰背挺直"
           },
           {
             "source": "fitness_data.csv",
             "page": null,
-            "score": 0.5331,
+            "score": 0.533,
             "snippet": "动作名称: 高脚杯深蹲 目标肌群: 股四头肌/臀大肌/核心 器械: 哑铃 难度: 中 步骤: 1. 双手持哑铃于胸前 2. 下蹲至大腿平行地面 3. 起身还原 注意事项: 哑铃贴近身体 膝盖与脚尖方向一致"
           },
           {
@@ -62,7 +62,7 @@
           }
         ]
       },
-      "answer_len": 131
+      "answer_len": 129
     },
     {
       "question": "腰突患者适合做什么康复训练",
@@ -75,49 +75,22 @@
       "fallback_active": false,
       "citations": [
         {
-          "kind": "web",
-          "source": "腰突患者怎么进行健康锻炼_腰椎间盘突出症_骨科_99健康网",
-          "snippet": "腰突患者的健康离不开日常的保健。那么你知道腰突患者怎么进行康复训练方法呢? 腰椎间盘突出症患者常存在腰背肌和腹肌力量的减弱,影响了腰椎稳定性,是腰痛迁延难愈的原因。因此,我们要重视腰背肌和腹肌的锻炼",
-          "url": "https://www.99.com.cn/guke/yzjptcz/438597.htm"
-        },
-        {
-          "kind": "web",
-          "source": "腰突怎么康复锻炼-三知健康",
-          "snippet": "赵凯 主任医师 康复医学科 安徽医科大学第一附属医院 腰突的康复锻炼不同时期锻炼不同,具体如下。 1. 早期康复:使用俯卧立体位疗法进行康复训练,让患者以俯卧位静卧5分钟。逐渐过渡到伸展俯卧位和腰背肌",
-          "url": "http://www.3zhijk.com/kpar/article/7113944826069961728.html"
-        },
-        {
-          "kind": "web",
-          "source": "腰突患者平时要做什么康复训练? - 问答频道 - 博禾医生",
-          "snippet": "腰椎间盘突出 的患者在平时的时候最好是训练倒着走,也可以在床上进行小燕飞锻炼,这样能够锻炼腰背部肌肉,能够避免腰椎间盘突出的病情加重",
-          "url": "https://www.bohe.cn/ask/view/103705877.html"
-        },
-        {
           "kind": "kb",
           "source": "臀桥",
           "snippet": "臀大肌/核心 | 徒手或杠铃"
         },
         {
-          "kind": "graph",
-          "source": "图谱·1跳",
-          "snippet": "[图谱·1跳] 臀桥 → 臀大肌: 臀桥 主要锻炼 臀大肌"
+          "kind": "kb",
+          "source": "单腿臀桥",
+          "snippet": "臀大肌 | 徒手"
         },
         {
           "kind": "graph",
           "source": "图谱·1跳",
-          "snippet": "[图谱·1跳] 臀桥 → 核心: 臀桥 主要锻炼 核心"
+          "snippet": "[图谱·1跳] 臀桥 → 臀大肌: 臀桥 主要锻炼 臀大肌"
         }
       ],
-      "usage": [
-        {
-          "prompt_tokens": 2138,
-          "completion_tokens": 421,
-          "total_tokens": 2559,
-          "model": "qwen3.7-plus",
-          "provider": "dashscope",
-          "latency_ms": 7154
-        }
-      ],
+      "usage": [],
       "retrieval": {
         "query": "腰突患者适合做什么康复训练",
         "docs": [
@@ -177,7 +150,7 @@
       "tag": "工具计算",
       "highlight": "确定性计算注入上下文，不让 LLM 自行算术",
       "profile": "身高175cm，体重75kg，目标：减脂",
-      "answer": "您的BMI为24.5，属于超重范围。针对您减脂目标，建议采用“有氧运动+力量训练”结合的方式。初期推荐快走、慢跑等中低强度有氧，配合深蹲、俯卧撑等自重训练提升基础代谢。需注意BMI对肌肉量大者可能高估，实际减脂效果应结合体脂率监测。建议进一步咨询专业教练以制定个性化方案。",
+      "answer": "您的BMI为24.5，属超重范围。鉴于您身高175cm、体重75kg且目标为减脂，建议通过“有氧运动+力量训练”结合的方式制造热量缺口，并严格控制饮食摄入。运动时请注意关节保护，循序渐进。如需更精准的个性化方案，建议进一步咨询专业教练。",
       "grounded": true,
       "refusal": false,
       "fallback_active": false,
@@ -190,12 +163,12 @@
       ],
       "usage": [
         {
-          "prompt_tokens": 765,
-          "completion_tokens": 85,
-          "total_tokens": 850,
+          "prompt_tokens": 570,
+          "completion_tokens": 70,
+          "total_tokens": 640,
           "model": "qwen3.7-flash",
           "provider": "dashscope",
-          "latency_ms": 1383
+          "latency_ms": 939
         }
       ],
       "retrieval": {
@@ -221,7 +194,7 @@
           }
         ]
       },
-      "answer_len": 136
+      "answer_len": 118
     },
     {
       "question": "肩袖损伤能练卧推吗",
@@ -234,37 +207,19 @@
       "fallback_active": false,
       "citations": [
         {
-          "kind": "web",
-          "source": "肩袖损伤能锻炼吗_民福康",
-          "snippet": "科普内容 肩袖损伤 患者是可以锻炼的,但是必须到医院进行核磁共振的影像学检查之后,明确诊断,然后在专业医生的指导之下进行功能康复锻炼,切不可盲目自行锻炼,否则会出现肩袖损伤加重、症状恶化等情况。 肩袖",
-          "url": "https://www.mfk.com/ask/yinpin/2006231.shtml"
-        },
-        {
-          "kind": "web",
-          "source": "【肩袖损伤的后期怎样锻炼治疗】-宋观礼-副主任医师 - 大众养生网",
-          "snippet": "肩袖损伤常有疼痛症状。这类情形一般都是可以适当进行功能活动的。例如扩胸运动,摇动关节等运动。可继续配合中医理疗,外用中药,其次还需循序渐进地主被动活动关节,逐渐增加运动负荷,以助于恢复,不可劳累着凉",
-          "url": "https://www.cndzys.com/ylcore/wendanew_info/3es1032117.html"
-        },
-        {
-          "kind": "web",
-          "source": "患有肩袖损伤症状能锻炼吗-普慈健康",
-          "snippet": "肩袖损伤症状不要着急盲目锻炼,对于有疼痛症状的患者应积极控制疼痛后,再在医生指导下适当科学的进行功能康复锻炼。 肩袖损伤以疼痛为主要症状,多由肩袖撕裂产生的炎症反应引起,同时肩袖损伤患者在活动时的摩擦",
-          "url": "https://www.pucijiankang.com/article/show/ae37bf4f061ed08950fe3c9af2a284db.html"
-        },
-        {
           "kind": "graph",
           "source": "图谱·1跳",
           "snippet": "[图谱·1跳] 肩袖损伤 → 面拉: 强化肩袖外旋肌群稳定性"
         },
         {
-          "kind": "graph",
-          "source": "图谱·1跳",
-          "snippet": "[图谱·1跳] 肩袖损伤 → 侧平举: 肩外展直接牵拉损伤肩袖"
+          "kind": "kb",
+          "source": "平板卧推",
+          "snippet": "胸大肌 | 杠铃"
         },
         {
-          "kind": "graph",
-          "source": "图谱·1跳",
-          "snippet": "[图谱·1跳] 肩袖损伤 → 推举: 肩关节外展加重肩袖撕裂"
+          "kind": "kb",
+          "source": "上斜哑铃卧推",
+          "snippet": "胸大肌上束 | 哑铃"
         }
       ],
       "usage": [],
@@ -310,7 +265,7 @@
       "tag": "问法重述",
       "highlight": "与第 1 问同义但措辞不同——展开「检索详情」可与第 1 例逐条对比得分",
       "profile": null,
-      "answer": "深蹲主要锻炼**股四头肌**和**臀大肌**。\n\n根据参考动作，不同变式侧重如下：\n1. **杠铃深蹲**：重点刺激股四头肌与臀大肌。\n2. **高脚杯深蹲**：强化上述两肌群，同时显著提升核心稳定性。\n3. **侧弓步蹲**：在基础肌群上，额外强化大腿内侧的内收肌。\n\n建议初学者从高脚杯深蹲开始，注意膝盖与脚尖方向一致以确保安全。",
+      "answer": "深蹲主要锻炼**股四头肌**和**臀大肌**。\n\n具体侧重如下：\n1. **杠铃深蹲**：重点刺激股四头肌与臀大肌。\n2. **高脚杯深蹲**：强化股四头肌、臀大肌及核心肌群。\n3. **侧弓步蹲**：额外针对内收肌（大腿内侧）。\n\n建议根据目标选择，初学者推荐从高脚杯深蹲起步以掌握发力感。",
       "grounded": true,
       "refusal": false,
       "fallback_active": false,
@@ -333,12 +288,12 @@
       ],
       "usage": [
         {
-          "prompt_tokens": 595,
-          "completion_tokens": 113,
-          "total_tokens": 708,
+          "prompt_tokens": 457,
+          "completion_tokens": 105,
+          "total_tokens": 562,
           "model": "qwen3.7-flash",
           "provider": "dashscope",
-          "latency_ms": 1146
+          "latency_ms": 1106
         }
       ],
       "retrieval": {
@@ -364,26 +319,26 @@
           }
         ]
       },
-      "answer_len": 167
+      "answer_len": 146
     },
     {
       "question": "量子力学和健身的关系",
       "tag": "弱相关问题",
       "highlight": "含『健身』故语义相关度略高于拒答阈值（0.40）→ 如实说明无直接关联，而不是硬编或过度拒答",
       "profile": null,
-      "answer": "量子力学属于物理学范畴，与日常健身无直接关联。健身主要依据运动生理学、生物力学及个性化原则进行训练。\n\n若您想了解如何根据自身情况制定安全有效的增肌或减脂计划，欢迎提供身体数据和目标，我将为您提供专业的健身建议。",
+      "answer": "量子力学与日常健身无直接关联。健身基于生理学、生物力学和运动科学，关注肌肉力量、耐力及心肺功能提升。建议您将注意力集中在科学的训练计划、营养摄入及恢复上。若您有具体的健身目标或身体数据，可提供更多信息，我将为您制定个性化的训练建议。",
       "grounded": true,
       "refusal": false,
       "fallback_active": false,
       "citations": [],
       "usage": [
         {
-          "prompt_tokens": 489,
-          "completion_tokens": 55,
-          "total_tokens": 544,
+          "prompt_tokens": 444,
+          "completion_tokens": 62,
+          "total_tokens": 506,
           "model": "qwen3.7-flash",
           "provider": "dashscope",
-          "latency_ms": 824
+          "latency_ms": 1183
         }
       ],
       "retrieval": {
@@ -392,7 +347,7 @@
           {
             "source": "全民健身指南（国家体育总局）",
             "page": null,
-            "score": 0.5562,
+            "score": 0.5563,
             "snippet": "个性化原则是指根据每个人的遗传特征、机能特点和运动习惯，制定个性化的运动健身方案。在制定运动健身方案时，要进行必要的医学检查和运动能力测试，以便了解每个人的具体情况，使运动健身方案更具个性特征。"
           },
           {
@@ -409,7 +364,7 @@
           }
         ]
       },
-      "answer_len": 106
+      "answer_len": 116
     },
     {
       "question": "如何挑选股票",

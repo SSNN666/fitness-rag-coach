@@ -163,9 +163,14 @@ def _verify_expectations(cases: list[dict]) -> None:
         for kw in exp.get("contains") or []:
             if kw not in blob:
                 problems.append(f"[{i}] 引用里找不到「{kw}」")
+        # excludes 查的是**被引用的动作条目名**，不是引用文本里出现过没出现过这几个字。
+        # 理由：图谱多跳路径的描述里出现某个动作名（如「竖脊肌→腰肌劳损→硬拉」）
+        # 是在解释关系，不等于把该动作当作参考条目引用；而 kb 引用的 source
+        # 就是动作名，它出现在这里才是「把禁忌动作当参考资料」。
+        cited_names = " ".join((c.get("source") or "") for c in built.get("citations") or [])
         for kw in exp.get("excludes") or []:
-            if kw in blob:
-                problems.append(f"[{i}] 引用里出现了不该有的「{kw}」")
+            if kw in cited_names:
+                problems.append(f"[{i}] 被引用的动作条目里出现了禁忌动作「{kw}」")
 
     if problems:
         print("\n⚠️  用例效果校验未通过（文案可能已与数据不符）：")
