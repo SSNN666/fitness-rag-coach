@@ -426,3 +426,58 @@ def test_debug_recent_clamps_limit(client, monkeypatch):
     r2 = client.get("/v1/debug/retrieval/recent?limit=0",
                     headers={"X-API-Key": "test-secret"})
     assert len(r2.json()["events"]) == 1   # 下限收敛
+
+
+# ----------------------------------------------------------------
+# /v1/vision 也必须计入成本、受成本闸门约束
+# ----------------------------------------------------------------
+#
+# 回归：vision 是**单次最贵**的调用，却既不记账也不受闸门约束——
+# 成本上限对它形同虚设。
+
+class _StubVision:
+    active_providers = ["dashscope"]
+
+    def __init__(self, tokens=1234):
+        self.tokens = tokens
+
+    def invoke_vision(self, data, prompt, mime=None):
+        from llm_adapter import UsageInfo
+        return SimpleNamespace(
+            content="报告显示各项指标基本正常。",
+            usage=UsageInfo(prompt_tokens=self.tokens - 34,
+                            completion_tokens=34, total_tokens=self.tokens,
+                            model="qwen3-vl-plus", provider="dashscope", latency_ms=800))
+
+
+def _post_vision(client):
+    return client.post("/v1/vision",
+                       files={"file": ("report.png", b"\x89PNG fake", "image/png")},
+                       data={"question": "这份报告怎么看"},
+                       headers={"X-API-Key": "test-secret"})
+
+
+def test_vision_records_usage_into_cost_ledger(client):
+    api.app.state.vision_llm = _StubVision(tokens=1234)
+    r = _post_vision(client)
+    assert r.status_code == 200
+    cost = api.app.state.pipeline._gateway.cost_snapshot()
+    assert cost["total_tokens"] == 1234, cost
+    assert cost["requests"] == 1
+
+
+def test_vision_blocked_by_cost_limit(client):
+    """硬阈值触发后 vision 端点同样拒绝——不能成为绕过闸门的后门。"""
+    from gateway import Gateway, GatewayConfig
+    api.app.state.pipeline._gateway = Gateway(GatewayConfig(
+        enabled=True, cost_guard_enabled=True,
+        cost_soft_limit_tokens=0, cost_hard_limit_tokens=100))
+    api.app.state.vision_llm = _StubVision()
+    gw = api.app.state.pipeline._gateway
+    from llm_adapter import UsageInfo
+    gw.log_usage("rid", "chat", UsageInfo(prompt_tokens=99, completion_tokens=99,
+                                          total_tokens=198, model="m",
+                                          provider="p", latency_ms=1))
+    r = _post_vision(client)
+    assert r.status_code == 429
+    assert r.json()["detail"]["kind"] == "cost_limit"

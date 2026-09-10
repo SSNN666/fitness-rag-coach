@@ -96,9 +96,14 @@ function kindClass(kind){
 function renderCase(c, idx){
   const pills = [
     `<span class="pill">${esc(c.tag)}</span>`,
-    c.refusal
-      ? `<span class="pill ref">已拒答</span>`
-      : `<span class="pill grd">已作答</span>`,
+    c.blocked
+      ? `<span class="pill ref">生成前已拦截</span>`
+      : (c.refusal
+         ? `<span class="pill ref">已拒答</span>`
+         : `<span class="pill grd">已作答</span>`),
+    c.blocked
+      ? `<span class="pill ref">命中字段：${esc((c.block_fields || []).join('、'))}</span>`
+      : '',
     c.fallback_active ? `<span class="pill ref">降级链生效</span>` : '',
     c.profile ? `<span class="pill">画像：${esc(c.profile)}</span>` : ''
   ].filter(Boolean).join('');
@@ -130,13 +135,15 @@ function renderCase(c, idx){
     <div class="body">
       <div class="answer">${render(c.answer)}</div>
       ${rewritten}
-      <div class="stats">回答 ${c.answer_len} 字 ｜ 引用 ${(c.citations||[]).length} 条</div>
+      ${c.blocked
+        ? `<div class="stats">拦截发生在检索与生成之前 —— 因此没有检索记录，也没有消耗任何模型调用。</div>`
+        : `<div class="stats">回答 ${c.answer_len} 字 ｜ 引用 ${(c.citations||[]).length} 条</div>
       <section>
         <details><summary>📚 参考来源（${(c.citations||[]).length}）</summary>${cites}</details>
       </section>
       <section>
         <details><summary>🔍 检索详情（三路融合后的来源与得分）</summary>${docs}</details>
-      </section>
+      </section>`}
     </div>
   </article>`;
 }

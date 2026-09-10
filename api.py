@@ -278,6 +278,12 @@ def vision(file: UploadFile = File(...),
             detail="未配置多模态模型（需 DASHSCOPE_API_KEY 以启用 qwen3-vl-plus）。",
         )
 
+    # 成本硬上限：多模态是**单次最贵**的调用，绝不能让这个端点绕开闸门
+    gateway = app.state.pipeline._gateway
+    ok_cost, cost_reason = gateway.check_cost_budget()
+    if not ok_cost:
+        raise HTTPException(status_code=429, detail={"kind": "cost_limit", "message": cost_reason})
+
     blocked, msg, detail = _guard_input(question, app.state.censor)
     if blocked:
         raise HTTPException(status_code=403, detail={**detail, "message": msg})
@@ -291,6 +297,10 @@ def vision(file: UploadFile = File(...),
     prompt = f"这是用户上传的健康检查/体检报告图片。请根据图片内容回答问题：{question}"
     # MIME 透传（PNG/JPEG 按真实类型发送；未声明时兜底 image/jpeg）
     resp = app.state.vision_llm.invoke_vision(data, prompt, mime=file.content_type or "image/jpeg")
+    # 记入成本账本：此前 vision 调用既不进日志也不进账本（漏挂 on_usage），
+    # 是除 rerank 之外第二条不记账的付费调用路径。
+    if resp.usage:
+        gateway.log_usage(request_id, "vision", resp.usage)
 
     answer = resp.content
     censor = app.state.censor

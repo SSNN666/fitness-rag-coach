@@ -735,3 +735,53 @@ def test_phase_lock_tolerates_missing_gateway():
     svc = _svc_with(None)
     with svc._phase_lock("r", "X"):
         pass
+
+
+# ================================================================
+# 成本记账的「无遗漏」护栏
+# ================================================================
+#
+# 背景：cost_guard 的账本挂在 Gateway.log_usage 上，前提是**每条付费调用路径都经过它**。
+# 实际漏了两处：reranker（build_llm("rerank") 没挂 on_usage）和 /v1/vision。
+# 前者不进日志也不进账本 → 成本上限对它是失效的。
+#
+# 这类「线接漏了」的问题单测抓不到（没有报错、功能正常），只能靠把不变量写成断言。
+
+# 这三个角色的 usage 由 pipeline 在生成时按 request_id 记一次（见 _generate 的 gen_role），
+# 所以它们**刻意不挂** on_usage——挂了会双记。其余一律必须挂。
+_PER_REQUEST_LOGGED_ROLES = {"chat", "chat_nothink", "chat_fast"}
+
+
+def test_every_serving_llm_has_usage_accounting():
+    """build_pipeline 里每个 LLM 要么挂 on_usage，要么在白名单内。
+
+    新增一个 LLM 角色却忘了挂账 → 这条断言失败（而不是悄悄多一条免费的调用路径）。
+    """
+    import inspect
+    import re
+    import pipeline as pipeline_mod
+
+    src = inspect.getsource(pipeline_mod.build_pipeline)
+    calls = re.findall(r'build_llm\(\s*"([^"]+)"([^)]*)\)', src)
+    assert calls, "没解析到 build_llm 调用，断言本身失效了"
+
+    unaccounted = []
+    for role, rest in calls:
+        if "on_usage" in rest:
+            continue
+        if role in _PER_REQUEST_LOGGED_ROLES:
+            continue
+        unaccounted.append(role)
+    assert unaccounted == [], (
+        f"这些角色的 LLM 调用没有任何用量记账路径: {unaccounted}。"
+        f"要么挂 on_usage=<回调>，要么在 _PER_REQUEST_LOGGED_ROLES 里说明为什么不用挂。")
+
+
+def test_reranker_llm_has_usage_callback():
+    """回归：reranker 曾漏挂 on_usage（既不进日志也不进成本账本）。"""
+    import inspect
+    import pipeline as pipeline_mod
+    src = inspect.getsource(pipeline_mod.build_pipeline)
+    m = [ln for ln in src.splitlines() if 'build_llm("rerank"' in ln]
+    assert m, "没找到 rerank 的构建语句"
+    assert "on_usage" in m[0], f"rerank 仍未挂记账回调: {m[0].strip()}"

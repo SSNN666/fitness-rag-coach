@@ -1083,10 +1083,21 @@ def build_pipeline() -> PipelineService:
     else:
         neo4j_driver = None
 
+    # 网关先建：下面 reranker 就要用它提供的记账回调（_bg_usage 依赖 gateway）
+    gateway = Gateway(GatewayConfig.from_module())
+
+    # 适配器：chat/hyde 主链；fact_check 经 to_runnable 进入 FactCheckEngine 的 LCEL 链
+    # 后台角色（hyde/rerank/fact_check）usage 统一走日志（request_id=background）
+    def _bg_usage(role, usage):
+        gateway.log_usage("background", role, usage)
+
     reranker = None
     if RERANKER_ENABLED:
         from reranker import FitnessReranker
-        reranker = FitnessReranker(llm=build_llm("rerank"))
+        # on_usage 必须挂：rerank 是一次真实的 LLM 调用（伤病/计划层每请求一次）。
+        # 原实现漏挂 → 它既不进日志、也不进成本账本，成了唯一一条**不记账的调用路径**，
+        # 与 cost_guard.py 里「记账必须挂在所有 LLM 调用的公共漏斗上」的前提直接冲突。
+        reranker = FitnessReranker(llm=build_llm("rerank", on_usage=_bg_usage))
 
     retriever = FitnessRAGRetriever(
         milvus_client=milvus_client,
@@ -1104,13 +1115,6 @@ def build_pipeline() -> PipelineService:
         neo4j_depth=NEO4J_DEPTH,
         neo4j_max_depth=NEO4J_MAX_DEPTH,
     )
-
-    gateway = Gateway(GatewayConfig.from_module())
-
-    # 适配器：chat/hyde 主链；fact_check 经 to_runnable 进入 FactCheckEngine 的 LCEL 链
-    # 后台角色（hyde/rerank/fact_check）usage 统一走日志（request_id=background）
-    def _bg_usage(role, usage):
-        gateway.log_usage("background", role, usage)
 
     llms = {
         "chat": build_llm("chat"),
