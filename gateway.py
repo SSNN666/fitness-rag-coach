@@ -354,7 +354,9 @@ class _TokenBudgetGuard:
     """级联截断：聊天历史 → 检索上下文。禁忌黑名单在 context 头部，始终保留。"""
 
     # 中英文句子边界分隔符（与 build_index.py 的文本分割器一致）
-    _SENTENCE_SEPS = re.compile(r"[。！？；\n](?![」』）\)])")
+    # ⚠️ 捕获组是必需的：split 用捕获组时会把分隔符保留为独立元素，
+    #    截断重组才能还原原标点与换行（见 _truncate_context）。
+    _SENTENCE_SEPS = re.compile(r"([。！？；\n](?![」』）\)]))")
 
     def __init__(self, cfg: GatewayConfig, logger: _StructuredLogger):
         self._cfg = cfg
@@ -497,16 +499,18 @@ class _TokenBudgetGuard:
         if _estimate_tokens(context) <= max_tokens:
             return context
 
-        # 按句子边界拆分
+        # 按句子边界拆分（捕获组 → 分隔符保留为独立元素：[句1, 分隔符1, 句2, ...]）
         parts = self._SENTENCE_SEPS.split(context)
-        kept = []
+        kept: list[str] = []
         current_tokens = 0
 
-        for part in parts:
-            t = _estimate_tokens(part)
+        for i in range(0, len(parts), 2):
+            seg = parts[i]
+            sep = parts[i + 1] if i + 1 < len(parts) else ""
+            t = _estimate_tokens(seg + sep)
             if current_tokens + t > max_tokens:
                 break
-            kept.append(part)
+            kept.append(seg + sep)
             current_tokens += t
 
         if not kept:
@@ -515,7 +519,10 @@ class _TokenBudgetGuard:
             char_limit = max(50, int(len(context) * ratio))
             return context[:char_limit] + "…"
 
-        return "。".join(kept) + "。[内容已截断]"
+        # 原样拼回（保留原标点与换行）。原实现用 "。".join(kept) 重组，
+        # 而 split 已吃掉分隔符 → ！？；与换行**全部变成「。」**：
+        # 禁忌黑名单按 \n 分条，被压成一行跑文后模型可读性显著下降。
+        return "".join(kept) + "[内容已截断]"
 
 
 # ============================================================

@@ -118,3 +118,39 @@ class TestContextWindowResolution:
         assert info["budget"] == int(g._resolve_ctx_window("dashscope")
                                      * GatewayConfig.from_module().token_budget_ratio)
         assert len(ctx) < len(huge)
+
+
+class TestContextTruncation:
+    """级联截断的 context 尾部截断：保留头部（安全数据）+ 保留原标点。"""
+
+    def _guard(self):
+        return _TokenBudgetGuard(GatewayConfig.from_module(), logger=None)
+
+    def test_keeps_head_and_original_punctuation(self):
+        """回归：原实现用 "。".join() 重组，而 split 已吃掉分隔符 →
+        ！？；与换行全部变成「。」，禁忌黑名单被压成一行跑文。"""
+        g = self._guard()
+        head = "【伤病禁忌黑名单】\n- 腰间盘突出禁忌: 硬拉\n- 半月板损伤禁忌: 深蹲跳\n"
+        body = "深蹲要循序渐进！注意膝盖不要内扣？先做热身；再上重量。" * 300
+
+        out = g._truncate_context(head + body, 200)
+
+        # 头部安全数据完整保留（截断只删尾部）
+        assert "硬拉" in out and "深蹲跳" in out
+        # 原标点与换行未被统一替换
+        assert "\n" in out
+        for mark in ("！", "？", "；"):
+            assert mark in out, f"{mark} 被吞掉了"
+        assert out.endswith("[内容已截断]")
+
+    def test_single_oversized_sentence_falls_back_to_char_cut(self):
+        """连一个句子都放不下时退化为字符级截断，仍返回可用内容而非空串。"""
+        g = self._guard()
+        out = g._truncate_context("深蹲" * 5000, 10)
+        assert out and len(out) > 10
+        assert out.endswith("…")
+
+    def test_short_context_returned_unchanged(self):
+        g = self._guard()
+        ctx = "深蹲主要锻炼股四头肌。"
+        assert g._truncate_context(ctx, 10000) == ctx
