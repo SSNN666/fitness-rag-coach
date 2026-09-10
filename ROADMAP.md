@@ -32,21 +32,20 @@
 
 ---
 
-## ✅ 待办 A：三件小事（约 1 小时）
+## ✅ 已完成：三件小事（2026-09-10）
 
-- [ ] **A1. 提交所有改动**
-  `fitness_rag_coach` 与 `user_insight_bot` 均有未提交改动。提交后评测记录里的
-  `git_dirty: True` 会变成 `False`，可追溯性才干净。
+- [x] **A1. 提交所有改动**
+  `fitness_rag_coach` → 分支 `fix/graph-verification-and-eval`（2 个提交）
+  `user_insight_bot` → 分支 `feat/factcheck-benchmark`（1 个提交）
+  ⚠️ 提交在**特性分支**上，未推送到远端；合并到 master/main 需手动操作。
 
-- [ ] **A2. eval 增量落盘**
-  现状：`save_results()` 只在**全部算完**后调用一次。风险：RAGAS 阶段若卡死（实测当天卡过两次），
-  前面已跑完的检索指标会**一起丢失**。
-  改法：`compute_retrieval_metrics()` 跑完后先落盘一次（可标记 `partial: true`），RAGAS 跑完后再覆盖。
+- [x] **A2. eval 增量落盘**
+  `compute_retrieval_metrics()` 跑完后先落一次盘（`meta.partial=true`），RAGAS 跑完再落完整结果。
+  `latest.json` 只指向完整跑，中间结果不覆盖权威指针。
 
-- [ ] **A3. Neo4j 接入 start.py**
-  容器 `neo4j-fitness` 创建时**未设 `--restart`**，重启电脑后需手动 `docker start neo4j-fitness`。
-  风险：面试演示前忘记启动 → 图谱页为空、三路检索退化成双路。
-  改法：`start.py` 启动时检测容器状态，未运行则自动 `docker start`（docker 不可用时跳过并提示）。
+- [x] **A3. Neo4j 接入 start.py**
+  `_ensure_neo4j()`：检测容器状态，未运行则 `docker start` 并等 7687 就绪；
+  docker 缺失/容器不存在只提示不阻断。两条路径均已实测。
 
 ---
 
