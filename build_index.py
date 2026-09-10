@@ -17,13 +17,13 @@ import time
 import uuid
 
 import jieba
-from langchain_community.document_loaders import CSVLoader
 from langchain_core.documents import Document
 from langchain_text_splitters import RecursiveCharacterTextSplitter
 from pymilvus import MilvusClient, DataType
 from rank_bm25 import BM25Okapi
 
 from config import *
+from doc_loaders import TABLE_BLOCK_SEP, load_document
 from llm_adapter import build_embeddings
 from retriever import save_bm25_to_pickle
 
@@ -78,20 +78,37 @@ def _extract_entity_labels(metadata: dict) -> list[str]:
 def _semantic_pre_chunk(raw_docs: list[Document]) -> list[Document]:
     """
     语义预分块：在 token 切分前，先按文档边界分组。
+    - **表格**：整张表独立成块，不与正文混排（见下）
     - CSV 行（source='fitness_data.csv'）：每行 = 一个独立动作，保持完整
     - PDF 页：按双换行（段落边界）切分
     这样 token splitter 只会在单条目超出预算时才细分。
+
+    ⚠️ 表格为什么必须独立成块：
+    切分器的分隔符含 "\\n"，而 Markdown 表格**按行分隔**——混在正文里会被
+    逐行打散成碎片，表格结构彻底丢失（LLM 拿到的是「| 动作 |」这种残行）。
+    独立成块后：常规表格整张落在同一个父块里；即便某张超大表仍超预算，
+    切分也会发生在**行边界**上（行本身完整），而不是切在行中间。
     """
-    merged = []
+    merged: list[Document] = []
     for doc in raw_docs:
         source = doc.metadata.get("source", "")
-        if source == "fitness_data.csv":
-            # CSV 每行已经是独立动作，保持原样
+
+        # 含表格的文档 → 正文与每张表各自成块
+        if TABLE_BLOCK_SEP in (doc.page_content or ""):
+            for seg in doc.page_content.split(TABLE_BLOCK_SEP):
+                seg = seg.strip()
+                if seg:
+                    md = doc.metadata.copy()
+                    md["is_table"] = seg.startswith("[表格]")
+                    merged.append(Document(page_content=seg, metadata=md))
+            continue
+
+        if source == CSV_FILE or doc.metadata.get("row") is not None:
+            # CSV 每行已经是独立条目，保持原样
             merged.append(doc)
         else:
-            # PDF：按段落切分
-            paragraphs = re.split(r"\n\s*\n", doc.page_content)
-            for para in paragraphs:
+            # 按段落边界切分
+            for para in re.split(r"\n\s*\n", doc.page_content):
                 para = para.strip()
                 if para:
                     merged.append(Document(
@@ -111,22 +128,18 @@ def build():
     # ================================================================
     # 1. 加载数据源
     # ================================================================
-    # 1a. CSV 动作库
-    # ⚠️ 必须显式传 metadata_columns：langchain_community CSVLoader 默认
-    # metadata_columns=()，列不进 metadata（只有 source/row），导致下游
-    # _extract_entity_labels / _build_neo4j 读 metadata["动作名称"] 等全部落空。
-    # ⚠️ 必须同时传 content_columns：一旦指定 metadata_columns，这些列会从
-    # page_content 中被移除（实测），动作名称/肌群/器械就进不了 BM25 与向量索引，
-    # 检索质量崩塌。显式列全 → page_content 与默认行为逐字节一致。
-    _CSV_COLUMNS = ["动作名称", "目标肌群", "器械", "难度", "步骤", "注意事项"]
-    loader = CSVLoader(
-        file_path=CSV_FILE,
-        encoding="utf-8",
-        metadata_columns=["动作名称", "目标肌群", "器械", "难度"],
-        content_columns=_CSV_COLUMNS,
-    )
-    raw_docs = loader.load()
+    # 1a. CSV 动作库 —— 统一走 doc_loaders 注册表（格式差异不再泄漏到这里）
+    # 注：原用 langchain_community CSVLoader，其默认行为（metadata_columns=()）
+    # 曾导致下游读 metadata 全部落空、图谱缺三种关系（见 CHANGELOG）。
+    # 现由 doc_loaders 显式控制：列名进正文，短列进 metadata，行为可确定。
+    raw_docs: list[Document] = []
+    if os.path.isfile(CSV_FILE):
+        raw_docs.extend(
+            Document(page_content=d.markdown, metadata=d.metadata)
+            for d in load_document(CSV_FILE)
+        )
     csv_count = len(raw_docs)
+    print(f"  CSV 动作库 {csv_count} 条")
 
     # 1b. 知识库文档摄入：
     #   优先 TEXT_KB_SOURCES 文本直抽（合规公开资料，零 OCR 错误）；
@@ -137,12 +150,14 @@ def build():
             if not os.path.isfile(path):
                 print(f"  [WARN] 文本源缺失: {path}，跳过")
                 continue
-            text = open(path, encoding="utf-8").read()
-            if text.strip():
-                raw_docs.append(Document(
-                    page_content=text,
-                    metadata={"source": entry["name"]}))
-            print(f"  文本直抽 {entry['name']}（{len(text)} 字符）")
+            docs = load_document(path)   # 按扩展名分发：txt/md/pdf/docx/xlsx
+            chars = 0
+            for d in docs:
+                md = dict(d.metadata)
+                md["source"] = entry["name"]   # 用配置的引用显示名覆盖文件名
+                raw_docs.append(Document(page_content=d.markdown, metadata=md))
+                chars += len(d.markdown)
+            print(f"  文档摄入 {entry['name']}（{len(docs)} 个单元 / {chars} 字符）")
     elif os.path.isdir(PDF_PAGES_DIR):
         pdf_pages_dir = PDF_PAGES_DIR
         from pdf_ocr import ocr_pages_parallel, ocr_single_page
