@@ -145,6 +145,11 @@ CONTEXT_BUDGET_RATIO = 0.55            # Retrieved context ceiling as fraction o
 ANSWER_BUDGET_MIN = 500                # Minimum tokens reserved for LLM generation output
 SESSION_MAX_COUNT = 64                 # 会话 store 上限（超出按最久未访问驱逐，防止内存只增不减）
 
+# 会话记忆持久化：进程内 dict → 落盘（跨重启保留多轮上下文）
+# 关掉即退回原「进程内 LRU、重启即失」行为
+SESSION_PERSIST_ENABLED = True
+SESSION_PERSIST_PATH = "sessions.json"  # 含用户对话内容，已加入 .gitignore
+
 # ============================================================
 # 切片配置（token 级，基于 tiktoken cl100k_base 编码）
 # ============================================================

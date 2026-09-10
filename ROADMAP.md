@@ -58,10 +58,15 @@
   现状：`_SessionHistory` 进程内 LRU（`SESSION_MAX_COUNT=64`），重启即失。
   目标：会话历史落盘（SQLite / JSON），跨重启可恢复；用户画像可跨会话复用。
 
-- [ ] **B2. 模型决策的工具调用**
-  现状：`health_tools.py` 的 `TOOL_REGISTRY` 是现成形状，但触发靠**关键词匹配**（`run_health_tools`）。
-  目标：把工具定义暴露给模型，由模型自主决定调用哪个（多步）；保留关键词触发作为降级兜底。
-  注：`llm_adapter.py` 已实现 tools 协议（`tool_calls` 流式组装），但 pipeline 零使用。
+- [x] **B2. 模型决策的工具调用**（2026-09-10 完成）
+  `health_tools.py` 新增 `tool_definitions()` / `execute_tool()` / `resolve_health_tools()`；
+  `config` 新增 `tool_router` 角色 + `HEALTH_TOOLS_MODEL_DECISION` 开关；
+  pipeline 把工具决策**从锁内移到锁外**（模型调用是网络 IO，进锁会阻塞检索段）。
+  **关键设计**：参数不由模型提供——身高/体重/年龄走确定性抽取，模型只选工具。
+  **成本控制**：仅当能抽到参数时才发起模型调用。
+  实测（真实 DashScope）：模型正确调用 BMI/饮水/心率，且对无关问题不调；
+  其中「我每天该补充多少液体」**关键词命中不了、模型选对了**。
+  测试 151 项通过（新增 7 项）。
 
 - [ ] **B3. 上下文管理**
   现状：已有令牌预算级联截断（`gateway.guard_token_budget`，头部保留 + 句子边界截断）。

@@ -38,6 +38,8 @@ from crag_search import build_search_query, format_search_results, search_fitnes
 from gateway import Gateway, GatewayConfig
 from grounding import assess_grounding, refusal_message
 from health_tools import resolve_health_tools
+# 会话存储已抽到 session_store.py（持久化 + LRU）；别名保留既有引用不变
+from session_store import SessionHistory as _SessionHistory, build_session_store
 from hyde import generate_hyde_drafts, hyde_retrieve, needs_rewrite, rewrite_query
 from llm_adapter import FallbackChain, build_embeddings, build_llm, to_runnable
 from retriever import FitnessRAGRetriever, load_bm25_from_pickle
@@ -117,22 +119,6 @@ class PipelineResult:
     usage: list = field(default_factory=list)       # [UsageInfo]
     fallback_active: bool = False
     error: str | None = None
-
-
-class _SessionHistory:
-    """轻量会话存储（替代 langchain_community ChatMessageHistory——该包已停维弃用）。
-
-    接口保持兼容（messages / add_message / clear），gateway 令牌预算守卫直接可用。
-    """
-
-    def __init__(self):
-        self.messages: list = []
-
-    def add_message(self, msg) -> None:
-        self.messages.append(msg)
-
-    def clear(self) -> None:
-        self.messages = []
 
 
 # ============================================================
@@ -963,14 +949,23 @@ class PipelineService:
         session.add_message({"type": "ai", "content": answer})
         self._touch(session_id)
         self._evict_lru()
+        self._persist_store()
 
     def _touch(self, session_id: str) -> None:
         """记录会话最近访问时间（读取历史也算访问，LRU 语义）。"""
+        touch = getattr(self._store, "touch", None)
+        if touch is not None:          # SessionStore：持久化存储自带 LRU
+            touch(session_id)
+            return
         import time
         self._last_access[session_id] = time.time()
 
     def _evict_lru(self) -> None:
-        """会话数超过 SESSION_MAX_COUNT 时按最久未访问驱逐（防内存只增不减）。"""
+        """会话数超过上限时按最久未访问驱逐（防内存只增不减）。"""
+        evict = getattr(self._store, "evict_lru", None)
+        if evict is not None:          # SessionStore：驱逐与持久化同处一地
+            evict()
+            return
         if len(self._store) <= SESSION_MAX_COUNT:
             return
         excess = len(self._store) - SESSION_MAX_COUNT
@@ -978,6 +973,21 @@ class PipelineService:
         for sid, _ts in oldest:
             self._store.pop(sid, None)
             self._last_access.pop(sid, None)
+
+    def _persist_store(self) -> None:
+        """会话落盘。store 为普通 dict 时静默跳过（测试/轻量用法不受影响）。
+
+        落盘失败不阻断请求：内存态照常工作，退化为原来的非持久行为。
+        每请求一次原子写——会话数 ≤ 64、单文件量级 KB，代价可接受；
+        若将来会话量级上升，改为「脏标记 + 定时刷盘」即可。
+        """
+        save = getattr(self._store, "save", None)
+        if save is None:
+            return
+        try:
+            save()
+        except Exception:
+            pass
 
     # ----------------------------------------------------------------
     # 日志辅助
@@ -1072,4 +1082,6 @@ def build_pipeline() -> PipelineService:
         gateway=gateway,
         fact_engine=fact_engine,
         fact_cache=fact_cache,
+        # 会话记忆持久化：进程重启后多轮上下文不丢（见 session_store.py）
+        store=build_session_store(),
     )
