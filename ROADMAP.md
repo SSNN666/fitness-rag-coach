@@ -54,9 +54,15 @@
 > 背景：目标岗位是 AI 应用 / Agent 开发；当前项目的短板是「Agent 部分薄」——
 > 工具是关键词触发而非模型决策、记忆是进程内 LRU 重启即失。
 
-- [ ] **B1. 记忆持久化**
-  现状：`_SessionHistory` 进程内 LRU（`SESSION_MAX_COUNT=64`），重启即失。
-  目标：会话历史落盘（SQLite / JSON），跨重启可恢复；用户画像可跨会话复用。
+- [x] **B1. 记忆持久化**（2026-09-10 完成）
+  新增 `session_store.py`：`SessionHistory` + `SessionStore(dict)`（对 pipeline/网关透明），
+  JSON 原子落盘（tmp → `os.replace`）；`config` 加 `SESSION_PERSIST_ENABLED` / `_PATH`。
+  坏文件空存储启动并自愈；落盘失败静默降级为内存态；普通 dict 时全部逻辑跳过（测试不受影响）。
+  **实测**：进程 1 问答落盘 → 进程 2（模拟重启）恢复 2 条历史 →
+  `needs_rewrite('那臀桥呢', 恢复的历史) = True`（对照组无历史 = False），
+  **多轮指代消解跨重启存活**。测试 164 项通过（新增 13 项）。
+  单测还抓出并修正了本项目一个真 bug：未 touch 的会话不在 `_last_access` 里，
+  只对其排序会把**有**时间戳的会话当最旧驱逐，与意图完全相反。
 
 - [x] **B2. 模型决策的工具调用**（2026-09-10 完成）
   `health_tools.py` 新增 `tool_definitions()` / `execute_tool()` / `resolve_health_tools()`；
