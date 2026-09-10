@@ -1,6 +1,6 @@
 {
   "meta": {
-    "timestamp": "2026-09-10T23:19:55",
+    "timestamp": "2026-09-10T22:45:09",
     "eval_mode": "ThreePath",
     "provider": "dashscope",
     "fusion_mode": "weighted",
@@ -13,51 +13,16 @@
     "testset": "test_100_full.csv",
     "n_samples": 100,
     "git_commit": "8271c9a",
-    "git_dirty": true,
-    "partial": false
+    "git_dirty": false,
+    "partial": true
   },
   "metrics": {
     "Hit@1": 0.8,
     "Hit@3": 0.9,
     "Hit@5": 0.94,
-    "MRR": 0.8495,
-    "faithfulness": 0.49,
-    "answer_relevancy": 0.95,
-    "context_precision": 0.76,
-    "context_recall": 0.64
+    "MRR": 0.8495
   },
-  "by_question_type": {
-    "基础问答": {
-      "n": 30,
-      "Hit@3": 1.0,
-      "MRR": 1.0
-    },
-    "动作纠错": {
-      "n": 10,
-      "Hit@3": 0.9,
-      "MRR": 0.9
-    },
-    "单伤病问答": {
-      "n": 25,
-      "Hit@3": 1.0,
-      "MRR": 1.0
-    },
-    "复合伤病问答": {
-      "n": 15,
-      "Hit@3": 1.0,
-      "MRR": 0.911
-    },
-    "计划生成": {
-      "n": 15,
-      "Hit@3": 0.6,
-      "MRR": 0.339
-    },
-    "定制长计划": {
-      "n": 5,
-      "Hit@3": 0.4,
-      "MRR": 0.44
-    }
-  },
+  "by_question_type": {},
   "samples": [
     {
       "query": "杠铃深蹲主要锻炼哪些肌群？正确的动作步骤和注意事项是什么？",
