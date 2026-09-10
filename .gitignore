@@ -60,3 +60,5 @@ Thumbs.db
 
 # 会话记忆落盘（含用户对话内容，运行时生成，不入库）
 sessions.json
+ingest_manifest.json
+embed_cache.json

@@ -24,6 +24,7 @@ from rank_bm25 import BM25Okapi
 
 from config import *
 from doc_loaders import TABLE_BLOCK_SEP, load_document
+from ingest_cache import EmbeddingCache, IngestManifest, embed_with_cache
 from llm_adapter import build_embeddings
 from retriever import save_bm25_to_pickle
 
@@ -33,6 +34,7 @@ os.environ.setdefault("OLLAMA_MAX_LOADED_MODELS", "2")
 
 SKIP_NEO4J = "--skip-neo4j" in sys.argv
 FAST_MODE = "--fast" in sys.argv
+FORCE_REBUILD = "--force" in sys.argv          # 忽略指纹清单与嵌入缓存，强制全量重建
 
 # 解析 --workers N（默认 2，--fast 模式默认 2）
 OCR_WORKERS = 2
@@ -123,7 +125,31 @@ def build():
 
     mode_str = "FAST" if FAST_MODE else "NORMAL"
     print(f"[MODE] {mode_str} | OCR workers={OCR_WORKERS} | resize={MAX_IMAGE_SIZE}px | embed_batch={EMBED_BATCH}")
-    print(f"[TIP]  加 --fast 使用快速防蓝屏模式，加 --skip-neo4j 跳过图谱\n")
+    print(f"[TIP]  加 --fast 使用快速防蓝屏模式，加 --skip-neo4j 跳过图谱，加 --force 忽略指纹强制重建\n")
+
+    # ================================================================
+    # 0. 源文件指纹比对（SHA256）—— 同一份文件重复摄入不必重跑
+    # ================================================================
+    source_files = [CSV_FILE] if os.path.isfile(CSV_FILE) else []
+    if TEXT_KB_SOURCES:
+        source_files += [e["file"] for e in TEXT_KB_SOURCES if os.path.isfile(e["file"])]
+    elif os.path.isdir(PDF_PAGES_DIR):
+        source_files += [os.path.join(PDF_PAGES_DIR, f)
+                         for f in sorted(os.listdir(PDF_PAGES_DIR))]
+
+    manifest = IngestManifest()
+    diff = manifest.diff(source_files)
+    print(f"[0/7] 源文件指纹比对：{diff.describe()}")
+    for label, items in (("新增", diff.new), ("变更", diff.changed), ("移除", diff.removed)):
+        for p in items[:5]:
+            print(f"      {label}: {p}")
+
+    if not diff.needs_rebuild and not FORCE_REBUILD:
+        print("      → 所有源文件内容未变（SHA256 一致），跳过重建。")
+        print("        如确需重建请加 --force")
+        return
+    if FORCE_REBUILD:
+        print("      --force：忽略指纹与嵌入缓存，强制全量重建")
 
     # ================================================================
     # 1. 加载数据源
@@ -300,12 +326,14 @@ def build():
     )
 
     # 批量写入（小批次 + 间隔，防 Ollama OOM）
+    # 嵌入缓存：以**内容哈希**为键复用向量——文档改一处，其余块不必重复调 API
+    embed_cache = EmbeddingCache(enabled=not FORCE_REBUILD)
     batch_size = EMBED_BATCH
     total_docs = len(child_docs)
     for i in range(0, total_docs, batch_size):
         batch = child_docs[i:i + batch_size]
         texts = [doc.page_content for doc in batch]
-        vecs = embeddings.embed_documents(texts)
+        vecs = embed_with_cache(embed_cache, texts, embeddings.embed_documents)
         data = [
             {
                 "id": str(uuid.uuid4()),
@@ -329,6 +357,8 @@ def build():
 
     # 检查写入数量
     print(f"[4/7] Milvus 写入完成 ({len(child_docs)} 条, dim={MILVUS_DIM})")
+    embed_cache.save()
+    print(f"       {embed_cache.describe()}")
 
     # 保存父块 JSON
     parent_dir = "milvus_data"
@@ -348,7 +378,10 @@ def build():
         print(f"[6/7] Neo4j 图谱构建完成")
 
     client.close()
-    print("[7/7] 全部索引构建完毕！")
+
+    # 记录本次摄入的源文件指纹：下次比对「内容是否变了」，未变可整轮跳过
+    manifest.record(source_files)
+    print(f"[7/7] 全部索引构建完毕！（已记录 {len(source_files)} 个源文件指纹）")
 
 
 # ================================================================
