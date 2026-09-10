@@ -28,6 +28,8 @@ from dataclasses import dataclass, field
 from logging.handlers import RotatingFileHandler
 from datetime import datetime, timezone
 
+from cost_guard import DEGRADED, EXHAUSTED, CostGuard
+
 
 # ============================================================
 # GatewayConfig
@@ -52,6 +54,19 @@ class GatewayConfig:
     noise_reduction_enabled: bool = True
     noise_similarity: float = 0.85
     noise_window: int = 5
+    noise_ttl_s: float = 600.0
+
+    # 会话级状态回收（限流/降噪按 session_id 建键）
+    state_max_keys: int = 512
+    state_sweep_interval_s: float = 60.0
+
+    # 成本上限（进程级累计 token）
+    cost_guard_enabled: bool = True
+    cost_soft_limit_tokens: int = 5_000_000
+    cost_hard_limit_tokens: int = 20_000_000
+    cost_window_s: float = 86400.0
+    # None = 仅内存（测试/本地调试）；from_module 时取 config.COST_GUARD_PATH
+    cost_guard_path: str | None = None
 
     # 令牌预算 (Strategy A)
     token_budget_enabled: bool = True
@@ -88,6 +103,16 @@ class GatewayConfig:
             noise_reduction_enabled=g(cfg, "NOISE_REDUCTION_ENABLED", True),
             noise_similarity=g(cfg, "NOISE_SIMILARITY", 0.85),
             noise_window=g(cfg, "NOISE_WINDOW", 5),
+            noise_ttl_s=g(cfg, "NOISE_TTL", 600),
+
+            state_max_keys=g(cfg, "GW_STATE_MAX_KEYS", 512),
+            state_sweep_interval_s=g(cfg, "GW_STATE_SWEEP_INTERVAL", 60),
+
+            cost_guard_enabled=g(cfg, "COST_GUARD_ENABLED", True),
+            cost_soft_limit_tokens=g(cfg, "COST_SOFT_LIMIT_TOKENS", 5_000_000),
+            cost_hard_limit_tokens=g(cfg, "COST_HARD_LIMIT_TOKENS", 20_000_000),
+            cost_window_s=g(cfg, "COST_WINDOW", 86400),
+            cost_guard_path=g(cfg, "COST_GUARD_PATH", None),
 
             token_budget_enabled=g(cfg, "TOKEN_BUDGET_ENABLED", True),
             token_budget_ratio=g(cfg, "CONTEXT_BUDGET_RATIO", 0.55),
@@ -306,9 +331,11 @@ class _NoiseReducer:
         try:
             key = f"_gw_noise_{session_id}"
             recent = session_state.get(key, [])
+            # ts 用于状态回收（无时间戳则无法判断该键是否已过期，只能永久驻留）
+            now = time.time()
 
             if not recent:
-                recent.append({"q": query, "tag": tag})
+                recent.append({"q": query, "tag": tag, "ts": now})
                 if len(recent) > self._cfg.noise_window:
                     recent.pop(0)
                 session_state[key] = recent
@@ -335,7 +362,7 @@ class _NoiseReducer:
                                        query_hash=hashlib.md5(query.encode()).hexdigest()[:8])
                     return True
 
-            recent.append({"q": query, "tag": tag})
+            recent.append({"q": query, "tag": tag, "ts": now})
             if len(recent) > self._cfg.noise_window:
                 recent.pop(0)
             session_state[key] = recent
@@ -612,7 +639,10 @@ class _MemoryGuard:
 # ============================================================
 
 class Gateway:
-    """轻量化网关门面，对 app.py 暴露 5 个钩子。"""
+    """轻量化网关门面：限流 / 降噪 / 令牌预算 / 内存降级 / 成本上限 / 结构化日志。"""
+
+    # 会话级状态键前缀（回收只处理自己的键，不动调用方放在同一 dict 里的其他东西）
+    _STATE_PREFIXES = ("_gw_rate_", "_gw_noise_")
 
     def __init__(self, cfg: GatewayConfig):
         self._cfg = cfg
@@ -621,6 +651,105 @@ class Gateway:
         self._noise_reducer = _NoiseReducer(cfg, self._log)
         self._token_guard = _TokenBudgetGuard(cfg, self._log)
         self._memory_guard = _MemoryGuard(cfg, self._log)
+        self._cost_guard = CostGuard(
+            soft_limit=cfg.cost_soft_limit_tokens,
+            hard_limit=cfg.cost_hard_limit_tokens,
+            window_s=cfg.cost_window_s,
+            path=cfg.cost_guard_path,
+            enabled=cfg.cost_guard_enabled,
+        )
+        self._last_sweep = 0.0
+
+    # ---- Hook 6: 成本上限 ----
+
+    @property
+    def cost_state(self) -> str:
+        """当前用量档位：ok / degraded（强制 cheapest 层）/ exhausted（拒绝新请求）。"""
+        return self._cost_guard.state
+
+    def cost_snapshot(self) -> dict:
+        return self._cost_guard.snapshot()
+
+    def check_cost_budget(self) -> tuple[bool, str]:
+        """返回 (allowed, reason)。
+
+        独立于 _cfg.enabled —— 成本闸门是安全设施，不该跟着日志/网关开关一起被关掉。
+        """
+        if not self._cfg.cost_guard_enabled:
+            return True, ""
+        if self._cost_guard.state == EXHAUSTED:
+            snap = self._cost_guard.snapshot()
+            _slog(self._log, 'warning', "cost_limit_exhausted",
+                  used=snap["total_tokens"], limit=snap["hard_limit"])
+            return False, ("服务今日用量已达上限，为避免产生更多费用已暂停应答。"
+                           "请稍后再试或联系管理员。")
+        return True, ""
+
+    # ---- 会话级状态回收 ----
+
+    @staticmethod
+    def _entry_last_active(v) -> float:
+        """键的最后活动时间；无法判定返回 0（视为最旧，优先回收）。"""
+        try:
+            if isinstance(v, dict):                    # 限流状态 {timestamps, blocked_until}
+                stamps = [t for t in (v.get("timestamps") or []) if t]
+                return max(stamps) if stamps else 0.0
+            if isinstance(v, list) and v:              # 降噪状态 [{q, tag, ts}, ...]
+                return max(float(e.get("ts", 0.0)) for e in v if isinstance(e, dict))
+        except Exception:
+            pass
+        return 0.0
+
+    def _sweep_state(self, session_state: dict) -> None:
+        """回收过期的会话级状态键（限流 / 降噪）。
+
+        为什么必须有：会话隔离后 session_id 按访客生成，每个键都活到进程结束。
+        原实现 session_id 恒为 "default_user"，字典永远只有一组键，问题被掩盖——
+        修会话隔离而不同步回收，等于把一个隐私 bug 换成内存泄漏。
+
+        两条触发路径（把 O(n) 从每请求摊薄到每 interval 一次）：
+          - 超过 interval 未清扫
+          - 键数超过硬上限（此时立即清扫，仍超则按最久未活动驱逐）
+        """
+        try:
+            now = time.time()
+            over_cap = len(session_state) > self._cfg.state_max_keys
+            if not over_cap and now - self._last_sweep < self._cfg.state_sweep_interval_s:
+                return
+            self._last_sweep = now
+
+            rate_window = self._cfg.rate_limit_window_s
+            removed = 0
+            for key in list(session_state):
+                if not key.startswith(self._STATE_PREFIXES):
+                    continue
+                v = session_state[key]
+                last = self._entry_last_active(v)
+                # 限流键：冷却期未过不能回收（否则封禁被提前解除）
+                if key.startswith("_gw_rate_"):
+                    cooling = isinstance(v, dict) and now < v.get("blocked_until", 0)
+                    if not cooling and (last == 0.0 or now - last > rate_window):
+                        session_state.pop(key, None)
+                        removed += 1
+                else:
+                    if last == 0.0 or now - last > self._cfg.noise_ttl_s:
+                        session_state.pop(key, None)
+                        removed += 1
+
+            # 硬上限兜底：清扫后仍超限（如短时大量不同 session_id）→ 驱逐最久未活动
+            evicted = 0
+            if len(session_state) > self._cfg.state_max_keys:
+                ours = [k for k in session_state if k.startswith(self._STATE_PREFIXES)]
+                ours.sort(key=lambda k: self._entry_last_active(session_state[k]))
+                for key in ours[: len(session_state) - self._cfg.state_max_keys]:
+                    session_state.pop(key, None)
+                    evicted += 1
+
+            if removed or evicted:
+                _slog(self._log, 'info', "gw_state_sweep", expired=removed,
+                      evicted=evicted, remaining=len(session_state))
+        except Exception as e:
+            _slog(self._log, 'error', "gateway_error", component="state_sweep", error=str(e))
 
     # ---- Hook 0: 速率限制 ----
 
@@ -630,6 +759,8 @@ class Gateway:
             return True, ""
         if session_state is None:
             return True, ""
+        # 每个请求都经过这里（限流+降噪的公共入口）→ 作为状态回收的挂载点
+        self._sweep_state(session_state)
         return self._rate_limiter.check(session_id, session_state)
 
     # ---- Hook 1: 请求降噪 ----
@@ -690,6 +821,9 @@ class Gateway:
     # ---- Hook 5: 完整日志（康养 Demo 扩展：query/检索片段/prompt/输出/token 消耗）----
 
     def log_usage(self, request_id: str, role: str, usage) -> None:
+        # 记账在 enabled 判断**之外**：成本核算是安全设施，不能跟着日志开关一起关掉，
+        # 否则关掉网关日志就出现一条完全不记账的调用路径。
+        self._cost_guard.record(usage)
         if self._cfg.enabled:
             self._log.log_usage(request_id, role, usage)
 

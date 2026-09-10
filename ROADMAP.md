@@ -150,6 +150,67 @@
 
 ---
 
+## ✅ 已完成：P0 三个安全/成本缺口（2026-09-10）
+
+> 背景：把服务当「真实在线服务」审视后发现的三个问题——都不是功能缺失，
+> 是**上线就会出事**的那种。顺序：先堵洞，再压测（见下）。
+
+- [x] **P0-1. user_profile 未过安全闸门**（`guardrails.py` / `api.py`）
+  `user_profile` 与 `question` 一样被拼进三套 Prompt 模板（`{user_profile}` 占位符），
+  却只检测了 `question`——把注入载荷放进画像字段即可整段绕过。
+  - `detect_injection_multi(fields)`：按**整个请求**跨字段累加权重，命中记录带字段名；
+    `detect_injection` 退化为其单字段特例。
+  - 跨字段累加而非逐字段判定：防「question 放半句、profile 放半句」的拆分投毒。
+  - 画像同时并入内容审核送检（一次调用合并，不增加审核延迟）。
+  - 顺手接上了零引用的 `PROMPT_INJECTION_ENABLED` 开关（此前是「写着能关、其实关不掉」）。
+  - **实测**：载荷放 profile → 旧路径 score=0 放行，新路径 score=5 拦截
+    （`fields=["user_profile"]`）；正常画像 score=0 不误伤。
+
+- [x] **P0-2. 会话隔离**（`app.py` / `gateway.py`）
+  UI 硬编码 `SESSION_ID = "default_user"` → 所有访客共用一份会话，后果有三：
+  ① 共用对话历史（**A 的多轮上下文会被拼进 B 的 Prompt**，隐私）
+  ② 共用限流桶（A 刷满额度 → B 收到 429）
+  ③ 共用降噪窗口（B 正常提问可能被判成「A 刚问过的重复问题」而 409）
+  改为随 `st.session_state` 生成本次访客的随机 ID（`ui-<16hex>`，无 cookie、无身份信息）。
+  - **连带修**：会话隔离后状态键随访客数增长，而 `gw_state` 此前**没有任何回收**
+    （只因 session_id 恒为一个值才没暴露）。新增 `Gateway._sweep_state`：
+    按限流窗口 / 降噪 TTL 回收过期键，超硬上限则按最久未活动驱逐；
+    清扫挂在 `check_rate_limit`（每请求必经）上并按 interval 摊薄。
+    只回收自己的前缀，不动调用方放在同一 dict 里的其他键。
+  - **实测**：AppTest 两个会话拿到不同 ID 且同一会话内 rerun 稳定；
+    A 用尽额度后 B 用不同 ID 问同一问题 → 200（修复前为 409）。
+
+- [x] **P0-3. 成本上限**（新增 `cost_guard.py`）
+  此前**只有用量日志、没有任何上限**——公开服务挂着 API Key，被刷就是真金白银的损失。
+  - 进程级累计 token 账本 + 两级闸门：**软阈值**关掉深思考（服务仍可用但更便宜），
+    **硬阈值**直接拒绝（只在真正失控时触发）。落盘，重启不清零。
+  - 记账挂在 `Gateway.log_usage`（所有 LLM 调用的公共漏斗），且**在 `enabled` 判断之外**——
+    否则关掉网关日志就出现一条完全不记账的调用路径。
+  - **刻意不降级的东西**：禁忌判定 / 硬过滤 / 事实核查 / CRAG / 分层检索。
+    前四项是安全链路；CRAG 与 Fact-Check **只对伤病类触发**，为省钱关掉它们
+    等于在最需要完整的回答上偷工减料——那类流量交给硬阈值统一兜底（直接拒绝），
+    而不是给一个「更便宜的伤病建议」。
+  - 顺手修：usage 日志的 `role` 字段三处硬编码 `"chat"` → 写真实层级
+    （`chat` / `chat_fast` / `chat_nothink`）。不改的话日志分不出用量来自哪一层，
+    **成本归属无从查起**——想优化成本先得知道钱花在哪个角色上。
+  - **实测**（真实服务）：硬阈值触发后 `/v1/chat` → 429、SSE → error 帧，
+    且被拒的两次请求 **token 增量为 0**（确认拒绝发生在花钱之前）；
+    软阈值下同一类问题 `chat`(3756 tokens) → `chat_nothink`(1826 tokens)，
+    **降 51%**，而两次的 `fact_check` 都照常执行（安全链路未受影响）。
+
+**测试 225 → 266 项。**
+
+---
+
+## ⏭️ 下一步：压测 → 按判据决定 Redis → Dockerfile
+
+> 预先承诺的判据（不做事后合理化）：压测后
+> **瓶颈在会话/限流状态 → 接 Redis**；**在 LLM 并发配额 / Milvus 锁 / 根本没到顶 → 不接**。
+> 界于此：**三个 P0 + 压测 + 按判据的 Redis + Dockerfile，到此为止**。
+> demo 部署押后（用户决定）。
+
+---
+
 ## 🔧 已知遗留问题（低优先级）
 
 | 问题 | 位置 | 说明 |
@@ -157,7 +218,7 @@
 | 图谱不可用时的连接超时 | `graph_view.py` / `retriever.py` | `connection_timeout=8`，无 Neo4j 时测试从 3s → 39s，线上请求同样吃延迟。建议加熔断或缩短超时 |
 | `entity_labels` 列建成但不回读 | `retriever.py:704-710` | 现依赖运行时从 `page_content` 现抽（兜底路径），Milvus 列未使用 |
 | 孤儿文件 | 仓库根目录 | `eval_results.csv` / `eval_results_threepath.csv` / `cleanup_c.bat` 无任何引用 |
-| 死配置 | `config.py` | `RERANKER_DOC_MAX_CHARS`（实际硬编码 200）、`HYDE_INJURY_KEYWORDS`（零引用）、`PROMPT_INJECTION_ENABLED`（零引用）、`SSE_CHUNK_CHARS`（死导入） |
+| 死配置 | `config.py` | `RERANKER_DOC_MAX_CHARS`（实际硬编码 200）、`HYDE_INJURY_KEYWORDS`（零引用）、`SSE_CHUNK_CHARS`（死导入）。（`PROMPT_INJECTION_ENABLED` 已于 P0-1 接上，移出本表） |
 | `contra_data` 重复条目 | `contra_data.py` | 「腰突」是「腰间盘突出」的截断副本，别名归一后永不可达 |
 | `fact_cache` 失效不含禁忌表变更 | `fact_cache.py` | 改 `contra_data` 后未 bump `FACT_CACHE_VERSION` 会吐旧答案 |
 | 文档陈旧 | `README.md` 等 | 部分 docstring 描述与实现不符（如 `pipeline.py:143` 仍写「单全局锁串行化」） |

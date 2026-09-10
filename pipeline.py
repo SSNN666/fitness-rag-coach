@@ -34,6 +34,7 @@ from dataclasses import dataclass, field
 from pymilvus import MilvusClient
 
 from config import *
+from cost_guard import DEGRADED as COST_DEGRADED
 from crag_search import build_search_query, format_search_results, search_fitness, crag_retrieve
 from gateway import Gateway, GatewayConfig
 from grounding import assess_grounding, refusal_message
@@ -186,6 +187,22 @@ class PipelineService:
             # 分层生成策略：按查询复杂度分配模型与预算
             tier = self._select_tier(question)
             tier_cfg = dict(LLM_TIERS.get(tier, LLM_TIERS["simple"]))
+
+            # 成本降级（软阈值）：关掉唯一的「可选奢侈品」——深度思考的思考 token
+            # 是单请求最大的成本乘数，且完全由用户勾选，关掉不影响任何安全环节。
+            #
+            # 刻意**不**降级的东西：禁忌判定 / 硬过滤 / 事实核查 / CRAG / 分层检索。
+            # 前四项是安全链路；CRAG 与 Fact-Check 只对伤病类触发，为省钱关掉它们
+            # 等于在最需要完整的回答上偷工减料——那类流量交给硬阈值统一兜底（直接拒绝），
+            # 而不是给一个「更便宜的伤病建议」。
+            #
+            # 必须在下方 deep_thinking 分支**之前**覆盖：该变量还会进缓存 key，
+            # 若在生成时才改，缓存 key 会声明思考态而实际没思考 → 跨模式串答案。
+            if deep_thinking and self._gateway.cost_state == COST_DEGRADED:
+                deep_thinking = False
+                self._gateway.log_cycle("info", request_id=rid,
+                                        event_detail="cost_degraded_deep_thinking_off")
+
             # 深度思考开关（用户自选）：复杂层默认快速（plus 关思考），开启后切 chat（思考开）+ 长预算
             if deep_thinking and tier in ("injury", "plan"):
                 tier_cfg["role"] = "chat"
@@ -468,6 +485,10 @@ class PipelineService:
         # ---- Step 9: 降级链生成（云 → 本地）----
         self._stage(gen.get("on_stage"), "正在生成回答…")
         on_delta = gen.get("on_delta")
+        # usage 日志里必须写**真实角色**（chat / chat_fast / chat_nothink）：
+        # 原实现三处都硬编码 "chat"，日志分不出用量来自哪一层 →
+        # 成本归属无从查起（想优化成本先得知道钱花在哪个角色上）。
+        gen_role = tier_cfg.get("role", "chat")
         if on_delta is not None:
             # 真流式:stream_events 逐 token 回调 + 末块 usage(流中降级标记随文本透出)
             parts: list[str] = []
@@ -489,7 +510,7 @@ class PipelineService:
             result.fallback_active = fb_switch or (chat_llm is not base_llm)
             if last_usage is not None:
                 result.usage.append(last_usage)
-                self._gateway.log_usage(rid, "chat", last_usage)
+                self._gateway.log_usage(rid, gen_role, last_usage)
         else:
             resp = chat_llm.invoke(messages, max_tokens=tier_cfg.get("max_tokens"),
                                    request_id=rid)
@@ -498,7 +519,7 @@ class PipelineService:
             result.fallback_active = resp.fallback or (chat_llm is not base_llm)
             if resp.usage:
                 result.usage.append(resp.usage)
-                self._gateway.log_usage(rid, "chat", resp.usage)
+                self._gateway.log_usage(rid, gen_role, resp.usage)
             if resp.error_kind:
                 result.error = resp.error_kind
 
@@ -519,7 +540,7 @@ class PipelineService:
             result.fallback_active = result.fallback_active or retry_resp.fallback
             if retry_resp.usage:
                 result.usage.append(retry_resp.usage)
-                self._gateway.log_usage(rid, "chat", retry_resp.usage)
+                self._gateway.log_usage(rid, "chat_nothink", retry_resp.usage)
 
         # ---- Step 10: 硬性禁忌过滤 ----
         answer, was_filtered = self._hard_filter(answer, forbidden)

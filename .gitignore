@@ -60,5 +60,7 @@ Thumbs.db
 
 # 会话记忆落盘（含用户对话内容，运行时生成，不入库）
 sessions.json
+# 成本账本（运行时生成，不入库；入库会让「本机用量」变成仓库里的陈旧数字）
+cost_state.json
 ingest_manifest.json
 embed_cache.json

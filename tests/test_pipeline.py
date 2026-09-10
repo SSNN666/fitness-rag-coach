@@ -166,6 +166,7 @@ class _Chunk:
 
 class _FakeGateway:
     """记录型假网关：默认放行/记录，不触网。"""
+    cost_state = "ok"          # 成本档位；测试可改成 "degraded" 验证降级分支
     def log_cycle(self, *a, **k): pass
     def log_retrieval(self, *a, **k): pass
     def log_prompt(self, *a, **k): pass
@@ -553,3 +554,93 @@ def test_rewrite_disabled_uses_original_question(monkeypatch):
     svc._append_history("default", "腰突能深蹲吗", "不建议深蹲，会加重腰椎负担。")
     svc.answer("那硬拉呢", session_id="default")
     assert retriever.seen_queries[0] == "那硬拉呢"
+
+
+# ================================================================
+# 成本降级（软阈值）：只关「可选奢侈品」，不碰安全链路
+# ================================================================
+
+class _DegradedGateway(_FakeGateway):
+    cost_state = "degraded"
+
+
+class _LongResp:
+    """足够长的假回答：绕开「回答长度守卫」的重生成分支。
+
+    _FakeResp.content 只有 8 字，会触发伤病层的短回答重试（再调一次 LLM），
+    调用次数变成 2——那是另一条链的行为，会掩盖本组用例真正要断言的东西。
+    """
+    content = "康复训练建议：" + "循序渐进，避免负重，以无痛范围为限。 " * 20
+    usage = None
+    fallback = False
+    error_kind = None
+
+
+class _RoleSpyChain(_FakeChain):
+    """记录每次 invoke 用的 messages，用于断言实际走了哪个角色。"""
+
+    def __init__(self, stop_event):
+        super().__init__(stop_event)
+        self.calls: list = []
+
+    def invoke(self, messages, **kw):
+        self.calls.append(messages)
+        return _LongResp()
+
+
+# 注意：必须用「伤病层但不会被生成前拒绝」的问题。
+# 「腰突能深蹲吗」会被边界拒绝直接返回（走不到生成），拿它测深思考会得到
+# 两条链都没被调用——看起来像功能失效，其实是压根没进生成阶段。
+_INJURY_Q = "腰突怎么康复训练"
+
+
+def _run_with_gateway(monkeypatch, gateway, **answer_kw):
+    import pipeline as pipeline_mod
+    monkeypatch.setattr(pipeline_mod, "REFUSE_ENABLED", False)
+    monkeypatch.setattr(pipeline_mod, "CRAG_ENABLED", False)
+
+    stop = threading.Event()
+    chat = _RoleSpyChain(stop)
+    chat_nothink = _RoleSpyChain(stop)
+    svc = PipelineService(
+        retriever=_DummyRetriever(),
+        llms={"hyde": _SpyChain(stop), "chat_fast": _SpyChain(stop),
+              "chat": chat, "chat_nothink": chat_nothink},
+        gateway=gateway, fact_engine=None, fact_cache=None, store={})
+    result = svc.answer(_INJURY_Q, **answer_kw)
+    assert result.refusal is False, "用例前提失效：该问题被生成前拒绝，测不到生成阶段"
+    return chat, chat_nothink
+
+
+def test_cost_degraded_turns_off_deep_thinking(monkeypatch):
+    """软阈值 → 关掉深思考（思考 token 是单请求最大成本乘数）。"""
+    chat, chat_nothink = _run_with_gateway(
+        monkeypatch, _DegradedGateway(), deep_thinking=True)
+    assert chat.calls == []            # 思考角色未被调用
+    assert len(chat_nothink.calls) == 1  # 落到关思考的主模型
+
+
+def test_deep_thinking_used_when_not_degraded(monkeypatch):
+    """对照：未降级时深思考照常生效（确认上面拦下来的是降级，不是别的原因）。"""
+    chat, chat_nothink = _run_with_gateway(
+        monkeypatch, _FakeGateway(), deep_thinking=True)
+    assert len(chat.calls) == 1
+    assert chat_nothink.calls == []
+
+
+def test_cost_degraded_keeps_safety_and_retrieval(monkeypatch):
+    """降级**不**动分层检索与安全链路：re‑check 伤病类仍走 injury 层。"""
+    import pipeline as pipeline_mod
+    monkeypatch.setattr(pipeline_mod, "REFUSE_ENABLED", False)
+    monkeypatch.setattr(pipeline_mod, "CRAG_ENABLED", False)
+    stop = threading.Event()
+    retriever = _SearchableRetriever()
+    svc = PipelineService(
+        retriever=retriever,
+        llms={"hyde": _SpyChain(stop), "chat_fast": _SpyChain(stop),
+              "chat": _SpyChain(stop), "chat_nothink": _SpyChain(stop)},
+        gateway=_DegradedGateway(), fact_engine=None, fact_cache=None, store={})
+    result = svc.answer("腰突能深蹲吗")
+    # 伤病类仍然被识别并拦截（禁忌判定没有因为省钱被跳过）
+    assert result.refusal is True
+    assert "深蹲" in result.answer

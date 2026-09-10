@@ -35,10 +35,10 @@ from pydantic import BaseModel, Field
 import log_reader
 from config import (
     API_KEY_AUTH, FEEDBACK_MAX_RECENT, FEEDBACK_PATH, LLM_PROVIDER_PRIMARY,
-    MAX_QUERY_CHARS, NEO4J_ENABLED, SSE_CHUNK_CHARS,
+    MAX_QUERY_CHARS, NEO4J_ENABLED, PROMPT_INJECTION_ENABLED, SSE_CHUNK_CHARS,
 )
 from content_moderation import build_censor
-from guardrails import detect_injection
+from guardrails import detect_injection_multi
 from llm_adapter import build_llm
 from pipeline import build_pipeline, PipelineService
 
@@ -127,15 +127,27 @@ app = FastAPI(title="康养知识库智能问答 API", version="1.0.0", lifespan
 # 防护辅助
 # ============================================================
 
-def _guard_input(question: str, censor) -> tuple[bool, str, dict]:
-    """注入检测 + 百度输入审核（同步、流式前）。返回 (blocked, message, detail)。"""
-    verdict = detect_injection(question)
-    if verdict.blocked:
-        _log.warning("injection_blocked score=%d hits=%s", verdict.score, verdict.hits)
-        return True, "检测到疑似 Prompt 注入，请求已拦截。", {"kind": "injection", "score": verdict.score}
+def _guard_input(question: str, censor,
+                 user_profile: str | None = None) -> tuple[bool, str, dict]:
+    """注入检测 + 百度输入审核（同步、流式前）。返回 (blocked, message, detail)。
+
+    user_profile 与 question 同级送检：两者都会被拼进 Prompt 模板
+    （{user_profile} 占位符），只查 question 等于给攻击者留了一个 500 字符的旁路。
+    """
+    if PROMPT_INJECTION_ENABLED:
+        verdict = detect_injection_multi({"question": question,
+                                          "user_profile": user_profile or ""})
+        if verdict.blocked:
+            fields = sorted({h[0] for h in verdict.hits})
+            _log.warning("injection_blocked score=%d fields=%s hits=%s",
+                         verdict.score, fields, verdict.hits)
+            return True, "检测到疑似 Prompt 注入，请求已拦截。", \
+                {"kind": "injection", "score": verdict.score, "fields": fields}
 
     if censor is not None:
-        cr = censor.check_text(question, task="RAG_QA_INPUT")
+        # profile 与 question 拼接后一次送审：两者都进 Prompt；合并调用不增加审核延迟
+        cr = censor.check_text(f"{question}\n{user_profile}" if user_profile else question,
+                               task="RAG_QA_INPUT")
         if not cr.passed:
             return True, "输入内容未通过安全审核，请修改后重试。", \
                 {"kind": "censor", "conclusion": cr.conclusion, "types": cr.blocked_types}
@@ -191,6 +203,9 @@ def healthz():
         "memory_degraded": pipeline._gateway.is_degraded,
         "neo4j_enabled": NEO4J_ENABLED,
         "fusion_mode": pipeline._retriever._fusion_mode,
+        # 成本账本：用量与档位（ok / degraded / exhausted）对外可见，
+        # 便于在账单异常时立刻定位是「谁在花」还是「花超了」
+        "cost": pipeline._gateway.cost_snapshot(),
     }
 
 
@@ -198,12 +213,17 @@ def healthz():
 def chat(req: ChatRequest):
     """非流式问答。防护链路与 SSE 端点对齐：注入检测 → 审核 → 网关限流/降噪。"""
     request_id = uuid.uuid4().hex[:12]
-    blocked, msg, detail = _guard_input(req.question, app.state.censor)
+    blocked, msg, detail = _guard_input(req.question, app.state.censor, req.user_profile)
     if blocked:
         raise HTTPException(status_code=403, detail={**detail, "message": msg})
 
-    # 网关限流 / 降噪（与 SSE 端点对称；模式 tag 与降噪器一致）
+    # 成本硬上限（与 SSE 端点对称）：已达上限直接拒绝，不再产生费用
     gateway = app.state.pipeline._gateway
+    ok_cost, cost_reason = gateway.check_cost_budget()
+    if not ok_cost:
+        raise HTTPException(status_code=429, detail={"kind": "cost_limit", "message": cost_reason})
+
+    # 网关限流 / 降噪（与 SSE 端点对称；模式 tag 与降噪器一致）
     allowed, reason = gateway.check_rate_limit(req.session_id, app.state.gw_state)
     if not allowed:
         raise HTTPException(status_code=429, detail={"kind": "rate_limit", "message": reason})
@@ -354,13 +374,19 @@ def _sse_gen(req: ChatRequest, request_id: str):
     yield evt("meta", {"request_id": request_id, "provider": LLM_PROVIDER_PRIMARY,
                        "banner": gateway.get_degraded_banner()})
 
-    # 1. 注入检测 + 输入审核（同步、流式前）
-    blocked, msg, detail = _guard_input(req.question, censor)
+    # 1. 注入检测 + 输入审核（同步、流式前；question 与 user_profile 同级送检）
+    blocked, msg, detail = _guard_input(req.question, censor, req.user_profile)
     if blocked:
         yield evt("error", {"message": msg, **detail})
         return
 
-    # 2. 网关限流 / 降噪
+    # 2. 成本硬上限（已在 api 入口判定，此处与 /v1/chat 对称）
+    ok_cost, cost_reason = gateway.check_cost_budget()
+    if not ok_cost:
+        yield evt("error", {"message": cost_reason, "kind": "cost_limit"})
+        return
+
+    # 3. 网关限流 / 降噪
     allowed, reason = gateway.check_rate_limit(req.session_id, app.state.gw_state)
     if not allowed:
         yield evt("error", {"message": reason, "kind": "rate_limit"})
@@ -372,7 +398,7 @@ def _sse_gen(req: ChatRequest, request_id: str):
                             "kind": "duplicate"})
         return
 
-    # 3. 流水线（后台线程）:阶段进度 + token 级 delta 经线程安全队列透出
+    # 4. 流水线（后台线程）:阶段进度 + token 级 delta 经线程安全队列透出
     progress: list[str] = []
     progress_lock = threading.Lock()
     delta_q: queue.Queue = queue.Queue()
@@ -437,7 +463,7 @@ def _sse_gen(req: ChatRequest, request_id: str):
     _remember_request(app.state.recent_answers, request_id,
                       req.question, result.answer, req.session_id)
 
-    # 4. 输出审核（生成后;增量区已展示的内容由 answer 帧兜底覆盖）
+    # 5. 输出审核（生成后;增量区已展示的内容由 answer 帧兜底覆盖）
     censor_note = None
     if censor is not None and not result.refusal:
         cr = censor.check_text(result.answer, task="RAG_QA_OUTPUT")
@@ -445,7 +471,7 @@ def _sse_gen(req: ChatRequest, request_id: str):
             result.answer = "该回答未通过内容审核，已屏蔽。请换一种问法。"
             censor_note = cr.conclusion
 
-    # 5. 权威全文 + 引用 + 完成
+    # 6. 权威全文 + 引用 + 完成
     text = result.answer
     yield evt("citations", {
         "docs": result.citations, "grounded": result.grounded, "refusal": result.refusal,

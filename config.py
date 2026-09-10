@@ -268,6 +268,27 @@ RATE_LIMIT_COOLDOWN = 30                  # 触发限流后的冷却秒数
 NOISE_REDUCTION_ENABLED = True
 NOISE_SIMILARITY = 0.85                   # 相似度阈值 (0-1)，越高越严格
 NOISE_WINDOW = 5                          # 与最近 N 条查询比较
+NOISE_TTL = 600                           # 降噪状态存活秒数（超时后不再与该访客的旧提问比对）
+
+# --- 成本上限（进程级累计 token 账本，保护被刷时的真金白银）---
+# 两级闸门：软阈值 → 强制走 cheapest 层（服务仍可用但变便宜）
+#           硬阈值 → 直接拒绝（只在真正失控时触发）
+# 阈值按 token 计（供应商真实返回的计量，可核对）。要用金额就自行换算：
+#     预算 token = 预算金额 ÷ 单价(元/千token) × 1000
+# 默认值按「单请求约 3-6k token」估算，≈1000 次请求触发降级、≈3000 次触发拒绝；
+# 上线前请按自己的实际预算改这两个值。
+COST_GUARD_ENABLED = True
+# 走环境变量：容器部署时改预算不该需要重建镜像（见 Dockerfile 步骤）
+COST_SOFT_LIMIT_TOKENS = int(os.getenv("COST_SOFT_LIMIT_TOKENS", "5000000"))    # 累计超过 → 关掉深思考
+COST_HARD_LIMIT_TOKENS = int(os.getenv("COST_HARD_LIMIT_TOKENS", "20000000"))   # 累计超过 → 拒绝新请求
+COST_WINDOW = 86400                   # 统计窗口秒数（默认 24h，到期自动清零）
+COST_GUARD_PATH = "cost_state.json"   # 落盘路径（重启不清零；不加就是绕过限额的捷径）
+
+# --- 会话级状态回收（限流/降噪按 session_id 建键）---
+# 会话隔离修复后 session_id 不再固定，状态键随访客数增长；不回收即无上限增长。
+# 原实现 session_id 恒为 "default_user"，这个问题被掩盖。
+GW_STATE_MAX_KEYS = 512                   # 状态键硬上限（超过按最久未活动驱逐）
+GW_STATE_SWEEP_INTERVAL = 60              # 两次清扫的最小间隔秒数（把 O(n) 摊薄）
 
 # --- 令牌预算守卫 Strategy A (复用已有 CONTEXT_BUDGET_RATIO=0.55 / ANSWER_BUDGET_MIN=500) ---
 TOKEN_BUDGET_ENABLED = True

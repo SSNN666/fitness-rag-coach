@@ -15,6 +15,7 @@ app.py —— Streamlit SSE 客户端（康养 Demo 重构）
 
 import json
 import time
+import uuid
 
 import httpx
 import streamlit as st
@@ -24,9 +25,20 @@ import graph_view
 
 API_BASE = f"http://{_cfg.API_HOST}:{_cfg.API_PORT}"
 API_KEY = _cfg.API_KEY_AUTH
-SESSION_ID = "default_user"
 
 st.set_page_config(page_title="AI 健身教练", page_icon="🏋️")
+
+# 会话隔离：每个浏览器会话一个独立 ID，随 st.session_state 生命周期存续。
+# 原实现硬编码 "default_user" —— 所有访客共用同一 session_id，后果有三：
+#   1. 共用对话历史：A 的多轮上下文会被拼进 B 的 Prompt（隐私问题）
+#   2. 共用量化限流桶：A 刷满额度会让 B 收到 429
+#   3. 共用降噪窗口：B 正常提问可能被当成「A 刚问过的重复问题」拒掉
+# 生命周期与 session_state.messages 一致（刷新页面 = 新会话 = 全新对话），
+# 且不含任何用户标识（纯随机），无需 cookie。
+if "session_id" not in st.session_state:
+    st.session_state.session_id = f"ui-{uuid.uuid4().hex[:16]}"
+SESSION_ID = st.session_state.session_id
+
 st.title("🏋️ AI 健身教练（康养知识库 RAG）")
 st.caption(f"后端 API: {API_BASE} | 主链路: {_cfg.LLM_PROVIDER_PRIMARY}"
            " | 云端不可用时自动降级本地模型")
