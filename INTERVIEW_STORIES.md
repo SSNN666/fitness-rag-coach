@@ -767,8 +767,86 @@ query embedding 是一次网络调用，而它在**锁内**。
 
 ---
 
+## 故事 21 ⭐⭐⭐：把 API Key 打了个包发给全世界
+
+**一句话**：我写 Dockerfile 时漏了一行 `.dockerignore`，
+`COPY . .` 把 `.env` 连同里面的 DASHSCOPE Key 和 Neo4j 密码一起打进了镜像层。
+
+**怎么发现的**：不是靠小心，是靠**去镜像里看了一眼**：
+
+```bash
+docker run --rm fitness-api:test ls -la /app/.env
+-rwxr-xr-x 1 root root 1095 /app/.env      ← 1095 字节，明文密钥
+```
+
+**为什么这事严重**：镜像不是「我本地的文件」。它会推到 registry、会被别人 pull、
+会被缓存、会被复制到测试环境。**镜像给谁，密钥就给谁**——
+而且它不是「代码里的一个变量」，是**已经分发出去的凭证，只能轮换，不能回收**。
+
+**怎么修的**：`.dockerignore` 加上 `.env` / `.env.*` / `*.pem` / `*.key`，
+镜像里的配置一律走 `docker run -e`。
+
+**讲法**：「这件事让我对『部署』有了不一样的理解。写代码时，
+配置和代码混在一起无所谓——反正都在我机器上。进了镜像就不是了：
+**镜像是个会被复制的产物**，往里放什么，等于往外发什么。
+我以前理解的 `.gitignore` 是『别提交垃圾』，
+现在理解的 `.dockerignore` 是**安全边界**。」
+
+---
+
+## 故事 22 ⭐⭐⭐：我写了个「构建期断言」，然后它当场抓出了我的错
+
+**一句话**：我在 Dockerfile 里加了一行 `import api` 冒烟检查，
+本意是防止自己漏装依赖——结果第一次构建就失败了，抓到的是我自己的错误判断。
+
+**背景**：做镜像瘦身。我读代码确认了每个包谁在用：
+
+| 包 | 谁在用 | 结论 |
+|---|---|---|
+| cnocr | 只有 `pdf_ocr.py`，且是函数体内 lazy import | 建索引用，排除 |
+| pdfplumber | 只有 `doc_loaders.py:289`，函数体内 | 建索引用，排除 |
+| **pandas** | **只有 `eval_testset.py`** | **离线评测用，排除** |
+| streamlit | 只有 `app.py` | 前端进程，排除 |
+
+排查完很确信。然后构建：
+
+```
+pymilvus/orm/schema.py:17: import pandas as pd
+ModuleNotFoundError: No module named 'pandas'
+```
+
+**我漏了传递依赖**：`pandas` 确实没被我的代码 import，
+但 **pymilvus 在模块级 import 它**，而 pymilvus 是服务链路的硬依赖。
+
+**我当时的反应不是「改掉排除」**，而是先想：**这个错误本来该怎么被发现？**
+如果我只靠读代码，它会一路溜到部署，然后**在收到第一个请求时炸**。
+所以我加了一行：
+
+```dockerfile
+RUN uv run --no-sync python -c "import api, pipeline, retriever, ... ; print('import smoke ok')"
+```
+
+这行是**构建期断言**——把我"以为"的依赖关系，变成构建必须通过的检查。
+后面它又救了我一次：我一开始把这行放在依赖层（`COPY pyproject.toml` 之后、
+`COPY . .` 之前），构建报 `No module named 'api'`——因为那时还没有 `api.py`。
+
+**顺带发现的第二层错**：我用 `--no-install-package cnocr` 排除 OCR，
+结果 `triton`/`wandb`/`ultralytics` 照样装进来了——
+**排除一个包不会排除它的依赖树**。最后改成声明式的
+`[project.optional-dependencies] ocr`，让"OCR 是可选功能"这件事写进项目定义，
+而不是在 Dockerfile 里维护一张会过期的黑名单。
+
+**讲法**：「这两个错误有一个共同点：**它们都是『我以为我读懂了代码』**。
+我的确逐个包读过了，读得也没错——`pandas` 确实没被我的代码 import。
+我错在只看了**我写的代码**，没看**我依赖的代码**。
+那行冒烟检查的价值就在于：它不依赖我的阅读理解，
+它让**机器**来验证我的判断，而且是在构建期、在我还没交付之前。」
+
+---
+
 ## 待追加
 
-（后续：Dockerfile）
+（本轮范围已结束：三个 P0 + 压测 + Redis 判据 + Dockerfile）
 
-- [ ] Dockerfile（部署最小集）
+- [ ] demo 部署（用户押后）
+- [ ] query embedding 移出锁（有数据、有估算，未执行——见 ROADMAP）

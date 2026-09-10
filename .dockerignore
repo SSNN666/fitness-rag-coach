@@ -1,0 +1,60 @@
+# 构建上下文瘦身 + 防止把本地运行时状态打进镜像
+# （COPY . . 会把整个目录塞进构建上下文，不加这个会有几百 MB 无关文件）
+
+# 虚拟环境 / 缓存
+.venv/
+__pycache__/
+**/__pycache__/
+*.pyc
+.pytest_cache/
+.uv/
+
+# ⚠️ 密钥文件：绝不能进镜像层（镜像分发给谁，谁就拿到你的 API Key 与数据库密码）。
+# 这条是实测发现的——第一版 .dockerignore 漏了它，.env 被 COPY . . 打了进去，
+# 用 `docker run --rm <img> ls /app/.env` 直接能看到。
+# 镜像里的配置一律走 `docker run -e`，见 DEPLOY.md。
+.env
+.env.*
+*.pem
+*.key
+
+# 运行时产物：会话内容、成本账本、日志、反馈——都是数据，且含用户对话
+sessions.json
+cost_state.json
+gateway.log
+gateway.log.*
+feedback.jsonl
+fact_cache.json
+
+# 索引产物：走挂载而非烘进镜像（见 DEPLOY.md）
+milvus.db
+bm25_index.pkl
+ingest_manifest.json
+embed_cache.json
+
+# 本体资料与摄入缓存 —— **只有建索引时读**，服务运行时不碰（实测 ~158MB）：
+# pdf_pages/ 是扫描件渲染缓存（125MB）、*.pdf/*.docx 是原始资料。
+# 已确认运行时无 .png/.pdf 引用（引用它们的都是 ingest_pdf / pdf_ocr / doc_loaders 的
+# 建索引分支，且全在函数体内 lazy import）。
+pdf_pages/
+milvus_data/
+pdf_ocr_cache.json
+test_milvus.db
+*.pdf
+*.docx
+*.png
+
+# 评测产物 / 临时文件
+eval_results/
+*.bak
+*.tmp
+demo/
+
+# 版本控制与 CI
+.git/
+.github/
+.gitignore
+
+# 文档与演示（运行时不需要，但保留 README 便于镜像内查看）
+*.md
+!README.md

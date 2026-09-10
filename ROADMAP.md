@@ -269,9 +269,49 @@
 
 ---
 
-## ⏭️ 下一步：Dockerfile（部署最小集）
+## ✅ 已完成：Dockerfile（部署最小集，2026-09-10）
 
-> 范围边界：**三个 P0 + 压测 + 按判据的 Redis + Dockerfile，到此为止**。demo 部署押后。
+新增 `Dockerfile` + `.dockerignore` + [DEPLOY.md](DEPLOY.md)。**全部实建实跑验证过**，不是写完就交。
+
+| 阶段 | 镜像体积 | 怎么降的 |
+|---|---|---|
+| 第一版 | 2.97 GB | — |
+| 去掉 torch 系 | 1.7 GB | cnocr 移到 pyproject 的 `ocr` extra（声明式，不是列黑名单） |
+| 去掉 uv 下载缓存 | 1.38 GB | `uv sync --no-cache`——实测缓存 **919MB** 留在镜像层里 |
+| 去掉建索引资料 | 1.38 GB | `pdf_pages/` 125MB + 源 PDF 32MB |
+
+**跑通验证**（真实容器，非 mock）：`/healthz` 5 秒就绪；容器内跑完整流水线问答返回 200 + 3 条引用；
+画像注入在容器里同样 403；容器内可达宿主机 Neo4j（195 节点 / 337 关系）；
+成本账本**跨容器重建保留**（`docker stop` 后用同一卷重启，329 tokens 没归零）。
+
+**过程中撞出来的三个问题**（都已修，见 [INTERVIEW_STORIES.md](INTERVIEW_STORIES.md) 故事 21）：
+
+1. **密钥被打进镜像**：`.dockerignore` 漏了 `.env`，`COPY . .` 把 1095 字节的
+   DASHSCOPE/NEO4J 密钥写进了镜像层，`docker run --rm <img> ls /app/.env` 直接可见。
+   → `.env` / `*.pem` / `*.key` 全部排除，配置一律走 `docker run -e`。
+2. **排除清单是错的，被冒烟检查抓住**：以为 `pandas` 只有评测用，
+   实际 `pymilvus/orm/schema.py` 模块级就 `import pandas`——它是服务链路硬依赖。
+   → 加了构建期 `import api` 冒烟检查，这类错误**构建期就失败**。
+3. **`--no-install-package` 不排除依赖树**：排了 `cnocr`，`triton`/`wandb`/`ultralytics`
+   照样装进来。→ 改用 pyproject 的 `ocr` extra 做声明式排除。
+
+**另外两处配套改动**：
+- 5 个运行时状态路径（`COST_GUARD_PATH` / `SESSION_PERSIST_PATH` / `FACT_CACHE_PATH` /
+  `GATEWAY_LOG_PATH` / `FEEDBACK_PATH`）支持环境变量覆盖。
+  容器里这很关键：**`cost_state.json` 不持久化 = 重启即绕过成本上限**（已验证持久化生效）。
+- `pyproject.toml`：`cnocr` 从 `dependencies` 移到 `[project.optional-dependencies] ocr`。
+  ⚠️ 本地跑 `uv sync` 会把 cnocr 从 venv 移除，需要 OCR 建索引时用 `uv sync --extra ocr`。
+
+**明确没做**（Q15 划的线）：CI/CD、密钥服务、编排、多副本、灰度回滚。
+多副本要注意：会话/限流/成本状态都是进程内的，**多副本会各算各的**（限流与成本上限放大 N 倍）。
+
+---
+
+## 🏁 本轮范围到此结束
+
+> 三个 P0 + 压测 + 按判据的 Redis（结论：不接）+ Dockerfile，**全部完成**。
+> demo 部署押后（用户决定）。
+> 数据反向指出的一个优化（把 query embedding 移到锁外）**已记录未执行**，见上方压测一节。
 
 ---
 

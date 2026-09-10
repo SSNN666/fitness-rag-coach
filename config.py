@@ -124,7 +124,7 @@ CRAG_EXTERNAL_KEYWORDS = [
 # 事实缓存（高频伤病问答缓存校验通过的结果）
 FACT_CACHE_ENABLED = True
 FACT_CACHE_MAX = 200                   # 最多缓存条数
-FACT_CACHE_PATH = "fact_cache.json"
+FACT_CACHE_PATH = os.getenv("FACT_CACHE_PATH", "fact_cache.json")
 # 提示词版本（缓存 key 的一部分）：改动分层 Prompt / 层级 hint 后 bump 此值，
 # 旧缓存自动失效（实测教训：改 600 字约束后重启，旧长回答仍从缓存吐出，新提示词不生效）
 FACT_CACHE_VERSION = 2
@@ -148,7 +148,7 @@ SESSION_MAX_COUNT = 64                 # 会话 store 上限（超出按最久�
 # 会话记忆持久化：进程内 dict → 落盘（跨重启保留多轮上下文）
 # 关掉即退回原「进程内 LRU、重启即失」行为
 SESSION_PERSIST_ENABLED = True
-SESSION_PERSIST_PATH = "sessions.json"  # 含用户对话内容，已加入 .gitignore
+SESSION_PERSIST_PATH = os.getenv("SESSION_PERSIST_PATH", "sessions.json")  # 含用户对话内容，已加入 .gitignore
 
 # ============================================================
 # 切片配置（token 级，基于 tiktoken cl100k_base 编码）
@@ -255,7 +255,7 @@ def detect_keep_alive(threshold_gb: float = 10.0,
 
 # --- 主开关 ---
 GATEWAY_ENABLED = True
-GATEWAY_LOG_PATH = "gateway.log"          # 结构化日志路径 (JSON Lines)
+GATEWAY_LOG_PATH = os.getenv("GATEWAY_LOG_PATH", "gateway.log")   # 结构化日志 (JSON Lines)
 GATEWAY_LOG_LEVEL = "INFO"                # DEBUG | INFO | WARNING | ERROR
 
 # --- 速率限制 (滑动窗口，防止快速重复请求压垮 Ollama) ---
@@ -282,7 +282,7 @@ COST_GUARD_ENABLED = True
 COST_SOFT_LIMIT_TOKENS = int(os.getenv("COST_SOFT_LIMIT_TOKENS", "5000000"))    # 累计超过 → 关掉深思考
 COST_HARD_LIMIT_TOKENS = int(os.getenv("COST_HARD_LIMIT_TOKENS", "20000000"))   # 累计超过 → 拒绝新请求
 COST_WINDOW = 86400                   # 统计窗口秒数（默认 24h，到期自动清零）
-COST_GUARD_PATH = "cost_state.json"   # 落盘路径（重启不清零；不加就是绕过限额的捷径）
+COST_GUARD_PATH = os.getenv("COST_GUARD_PATH", "cost_state.json")  # 重启不清零；不持久化就是绕过限额的捷径
 
 # --- 会话级状态回收（限流/降噪按 session_id 建键）---
 # 会话隔离修复后 session_id 不再固定，状态键随访客数增长；不回收即无上限增长。
@@ -454,7 +454,7 @@ REWRITE_ENABLED = True
 # 用户反馈闭环（POST /v1/feedback → feedback.jsonl，
 # eval_testset.py --feedback 消费负反馈问题跑质量报告）
 # ============================================================
-FEEDBACK_PATH = "feedback.jsonl"
+FEEDBACK_PATH = os.getenv("FEEDBACK_PATH", "feedback.jsonl")
 FEEDBACK_MAX_RECENT = 200      # 内存保留最近应答数（反馈按 request_id 解析）
 
 # ============================================================

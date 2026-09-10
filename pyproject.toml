@@ -7,7 +7,6 @@ dependencies = [
     "rank-bm25>=0.2.2",
     "neo4j>=5.20.0",
     "jieba>=0.42.1",
-    "cnocr>=2.3.0",
     "pdfplumber>=0.11.0",
     "langchain>=1.3.4",
     "langchain-community>=0.4.2",
@@ -28,6 +27,18 @@ dependencies = [
     "python-docx>=1.2.0",
     "openpyxl>=3.1.5",
 ]
+
+[project.optional-dependencies]
+# 扫描件 OCR —— **仅离线建索引需要**，在线服务一次都不会 import 它。
+# cnocr 会把 torch / torchvision / pytorch-lightning / ultralytics / wandb 一起拖进来
+# （数 GB），放在基础依赖里会让「部署 API」的镜像白白背上它们。
+#
+#   只跑服务 / 跑测试:      uv sync
+#   建索引（含扫描件）:      uv sync --extra ocr
+#
+# 依赖它的入口（都是独立脚本，不在 API 的 import 链上）：
+#   ingest_pdf.py、build_index.py / doc_loaders.py 的 OCR 分支
+ocr = ["cnocr>=2.3.0"]
 
 [[tool.uv.index]]
 url = "https://pypi.tuna.tsinghua.edu.cn/simple"
