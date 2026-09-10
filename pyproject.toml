@@ -24,6 +24,7 @@ dependencies = [
     "requests>=2.34.2",
     "beautifulsoup4>=4.15.0",
     "fastapi>=0.141.1",
+    "mcp>=2.2.0",
 ]
 
 [[tool.uv.index]]

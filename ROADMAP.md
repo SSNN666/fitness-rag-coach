@@ -86,16 +86,25 @@
 
 ---
 
-## 🔌 待办 C：MCP 封装（3-5 天）
+## ✅ 已完成：C MCP 封装（2026-09-10）
 
-把整条能力暴露成 MCP Server，供任意 MCP 客户端（Claude Code 等）调用：
+新增 `mcp_server.py`（依赖 `mcp>=2.2.0`），暴露 6 个工具：
 
-- [ ] `search_knowledge_base(query, k)` —— 三路检索
-- [ ] `check_contraindication(injury, action)` —— 禁忌判定（**独家能力**，图谱 + 本地双源）
-- [ ] `get_injury_graph(injury, depth)` —— 图谱多跳
-- [ ] `calculate_bmi / water_intake / heart_rate_zone` —— 确定性计算（`TOOL_REGISTRY` 直接映射）
+- [x] `search_knowledge_base(query, k)` —— 三路检索（懒加载；Milvus 单进程独占见下）
+- [x] `check_contraindication(injury, action)` —— 禁忌判定（**独家能力**，别名归一 + 子串匹配）
+- [x] `get_injury_graph(injury, depth)` —— 图谱多跳，未启用/连不上时给可读指引
+- [x] `calculate_bmi` / `estimate_water_intake` / `heart_rate_zone` —— 由 `TOOL_REGISTRY` 自动生成
 
-> 这一步把「一个问答应用」变成「其他 Agent 可消费的能力」，是 reviewer 点名的方向。
+**实测**（真实 MCP 协议握手，非 mock）：协议版本 `2025-11-25`，6 个工具全部可调用；
+`get_injury_graph('腰突', 2)` 返回 13 条路径，含 `腰突 → 硬拉 → 竖脊肌` 这类间接关联。
+
+⚠️ MCP SDK 2.x 把 `FastMCP` 改名为 `MCPServer`（`from mcp.server.mcpserver import MCPServer`），
+`list_tools()` 为异步——照搬旧版 API 会踩坑。
+
+⚠️ Milvus Lite 单进程独占：API 在跑时 MCP 的检索类工具无法打开向量库
+（禁忌判定与健康计算不受影响）。要并存需让 MCP 改走 API 的 HTTP 接口。
+
+测试 186 项通过（新增 14 项）。
 
 ---
 

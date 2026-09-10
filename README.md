@@ -259,10 +259,56 @@ python -u eval_testset.py --cloud --limit 20          # 云端评测（需 DASHS
 - **为什么不用 VL 做 PDF 文档提取**：多模态模型逐页解析速度慢、成本高、对纯文本精度不如 OCR 专项模型；VL 仅用于体检报告图片问答（/v1/vision）这类真实多模态场景——职责分离、成本可控。
 - **爬虫/版权风险认知**（可展开）：数据采集需区分「公开许可 vs 公开可见」；爬取需遵守 robots.txt、频率限制与网站条款；医疗健康内容需注明来源与时效，AI 输出不构成诊疗建议。
 
+## 🔌 MCP Server（把能力交给其他 Agent）
+
+`mcp_server.py` 把项目从「一个问答应用」变成「**其他 Agent 可消费的能力**」：
+任意 MCP 客户端（Claude Code / Claude Desktop 等）都能直接调用这里的检索、
+禁忌判定、图谱多跳与确定性健康计算。
+
+| 工具 | 依赖 | 说明 |
+|---|---|---|
+| `search_knowledge_base` | Milvus + BM25 + Neo4j | 三路检索，返回命中片段、来源与得分 |
+| `check_contraindication` | contra_data（+Neo4j 可选） | 某动作对某伤病是否禁忌，**含具体原因** |
+| `get_injury_graph` | Neo4j | 伤病关联动作的多跳路径 |
+| `calculate_bmi` / `estimate_water_intake` / `heart_rate_zone` | 无 | 确定性健康计算 |
+
+```bash
+python mcp_server.py --list       # 列出已注册工具
+python mcp_server.py --selftest   # 本地跑一遍各工具，验证可用性
+python mcp_server.py              # stdio 模式（供 MCP 客户端接入）
+python mcp_server.py --transport sse
+```
+
+客户端配置：
+
+```json
+{
+  "mcpServers": {
+    "fitness-rag": {
+      "command": "<项目路径>/.venv/Scripts/python.exe",
+      "args": ["<项目路径>/mcp_server.py"]
+    }
+  }
+}
+```
+
+实测（真实 MCP 协议握手，非 mock）：协议版本 `2025-11-25`，暴露 6 个工具；
+`check_contraindication('腰突','硬拉')` → 正确返回「禁忌动作」及原因；
+`get_injury_graph('腰突', 2)` → 13 条路径，含 `腰突 → 硬拉 → 竖脊肌` 这类
+**文本知识库看不出的间接关联**。
+
+> ⚠️ **Milvus Lite 单进程独占**：API 服务（`api.py`）在跑时，MCP 的检索类工具
+> 无法打开向量库；禁忌判定与健康计算不受影响（不碰 Milvus）。
+
 ## 🗂️ 结构
 
 ```
 ├── CHANGELOG.md           # 变更记录（2026-08-13 康养 Demo 改造日全记录）
+├── ROADMAP.md             # 当前状态与后续计划（防上下文丢失）
+├── INTERVIEW_STORIES.md   # 面试故事集（11 个故事 + 讲法 + 追问预案）
+├── CONTEXT_MANAGEMENT.md  # 上下文管理设计（预算/级联截断/头部保留）
+├── mcp_server.py          # MCP Server：把检索/禁忌判定/图谱/计算暴露给其他 Agent
+├── session_store.py       # 会话记忆持久化（JSON 原子写，跨重启恢复）
 ├── start.py / start.bat   # 一键启动（API+UI、健康检查、自动开浏览器、Ctrl+C 全停）
 ├── kb_18fa.txt            # 《科学健身18法》文本直抽（体科所，合规公开）
 ├── kb_zhinan.txt          # 《全民健身指南》文本直抽（国家体育总局，合规公开）
