@@ -1,5 +1,10 @@
 # 只读演示（公网可部署）
 
+> ⚠️ **本目录兼作 GitHub Pages 的发布目录**，所以叫 `docs/` 而不是 `demo/`——
+> GitHub Pages 的分支部署**只支持仓库根目录和 `/docs`** 两个位置，
+> 叫 `demo/` 的话在 Pages 设置里根本选不到（实测踩过）。
+> 这里放的是**演示快照**，不是项目文档；项目文档在仓库根目录（`ROADMAP.md` 等）。
+
 一个**无需后端、无需 API Key、无需向量库**的静态演示：面试官点开链接就能看到系统
 在各条链路上的真实输出——分层策略、引用来源、检索得分、禁忌拦截、拒答判定、工具计算。
 
@@ -26,7 +31,7 @@ python build_demo.py            # 跑完整管线，生成 demo_data.json
 产物：
 
 ```
-demo/
+docs/
 ├── index.html       # 自包含页面（无 CDN 依赖）
 ├── demo_data.json   # build_demo.py 生成的真实结果
 └── README.md
@@ -37,7 +42,7 @@ demo/
 本地预览：
 
 ```bash
-cd demo && python -m http.server 8899
+cd docs && python -m http.server 8899
 # 浏览器打开 http://127.0.0.1:8899
 ```
 
@@ -45,10 +50,10 @@ cd demo && python -m http.server 8899
 
 | 方式 | 步骤 | 成本 |
 |---|---|---|
-| **GitHub Pages**（推荐） | 仓库 Settings → Pages → Source 选分支，目录填 `/demo` | 免费 |
-| 阿里云 OSS / 腾讯云 COS | 开启静态网站托管，上传 `demo/` 两个文件 | 近乎免费 |
+| **GitHub Pages**（推荐） | 仓库 Settings → Pages → Source 选分支，目录填 **`/docs`**（只有 `/` 和 `/docs` 可选） | 免费 |
+| 阿里云 OSS / 腾讯云 COS | 开启静态网站托管，上传 `docs/` 两个文件 | 近乎免费 |
 | HuggingFace Spaces | 选 Static 类型，上传同两个文件 | 免费 |
-| Vercel / Netlify | 拖拽 `demo/` 目录 | 免费 |
+| Vercel / Netlify | 拖拽 `docs/` 目录 | 免费 |
 
 部署后把链接放进简历/README 即可——**面试官不用 clone 仓库、不用配环境就能看到东西**，
 这对学历不占优的候选人性价比很高。

@@ -48,7 +48,7 @@ test_milvus.db
 eval_results/
 *.bak
 *.tmp
-demo/
+docs/
 
 # 版本控制与 CI
 .git/

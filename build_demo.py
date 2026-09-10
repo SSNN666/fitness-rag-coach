@@ -1,8 +1,8 @@
 """
 build_demo.py —— 构建只读演示数据
 ==================================
-把若干**代表性问题**离线跑一遍完整管线，产出静态数据（`demo/demo_data.json`），
-配合 `demo/index.html` 就是一个**无需后端、无需 API Key、无需 Milvus** 的公网 demo。
+把若干**代表性问题**离线跑一遍完整管线，产出静态数据（`docs/demo_data.json`），
+配合 `docs/index.html` 就是一个**无需后端、无需 API Key、无需 Milvus** 的公网 demo。
 
 为什么用「预置问答」而不是真的在线跑
 ------------------------------------
@@ -84,7 +84,9 @@ DEMO_CASES: list[dict] = [
     },
 ]
 
-OUT_DIR = "demo"
+# 目录名必须是 docs：GitHub Pages 的分支部署**只支持 / 和 /docs** 两个位置，
+# 叫 demo/ 的话在 Pages 设置里根本选不到（实测踩过）。
+OUT_DIR = "docs"
 OUT_FILE = os.path.join(OUT_DIR, "demo_data.json")
 
 
