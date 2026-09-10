@@ -75,7 +75,16 @@ BM25_INDEX_PATH = "./bm25_index.pkl"
 FUSION_WEIGHT_MILVUS = 0.40          # Milvus 语义向量权重（原 0.50，给图谱让空间）
 FUSION_WEIGHT_BM25 = 0.30            # BM25 关键词权重（不变）
 FUSION_WEIGHT_NEO4J = 0.30           # Neo4j 图谱关联权重（原 0.20，提升以发挥多跳推理价值）
-FUSION_THRESHOLD = 0.20              # 全局最低分数阈值，低于此值丢弃
+FUSION_THRESHOLD = 0.20              # 融合**加权分**阈值（多路认可的最低加权分）
+# 向量路专属的**原始余弦**地板：加权分阈值对最低权重那一路是失效的——
+#   有效门槛 = FUSION_THRESHOLD / w_route → 普通 0.50 | 单伤病 0.667 | 复合 1.00
+# 复合伤病问句要求余弦 ≥ 1.00，即向量路**永远**被丢弃（实测：Milvus 返回的
+# 0.576/0.559/0.527 高相关内容全被丢，融合结果 5/5 只有图谱）。
+#
+# 取值 0.20 = 与 FUSION_THRESHOLD 同值。实测对比过 0.40（grounding 的校准口径）：
+#   0.40 那版 Hit@3 反而掉到 0.89（低于改前的 0.91）、无命中样本回到 5 条——
+#   收紧地板把有用内容一起滤掉了。故取更松的 0.20（对应 Hit@3 0.92 / 无命中 4 条）。
+VECTOR_RAW_FLOOR = 0.20
 CONTEXT_DOCS_MAX = 3                  # 送入 LLM 的最终文档数上限
 FUSION_SEMANTIC_DEDUP_ENABLED = False  # 语义去重：余弦相似度 > 阈值时仅保留得分高者
 FUSION_SEMANTIC_DEDUP_THRESHOLD = 0.85  # 语义去重余弦相似度阈值

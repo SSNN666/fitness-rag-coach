@@ -24,7 +24,7 @@ import jieba
 import numpy as np
 from langchain_core.documents import Document
 from pymilvus import MilvusClient
-from config import MILVUS_COLLECTION, NEO4J_DATABASE
+from config import MILVUS_COLLECTION, NEO4J_DATABASE, VECTOR_RAW_FLOOR
 
 
 class FitnessRAGRetriever:
@@ -759,8 +759,8 @@ class FitnessRAGRetriever:
         Returns:
             [(Document, final_score), ...] 按得分降序
         """
-        # key = MD5 → (Document, accumulated_score)
-        doc_map: dict[str, tuple[Document, float]] = {}
+        # key = MD5 → (Document, 加权分, 单路原始最高分, 命中过它的路集合)
+        doc_map: dict[str, tuple[Document, float, float, set[int]]] = {}
 
         for path_idx, results in enumerate(path_results):
             w = weights[path_idx]
@@ -769,16 +769,39 @@ class FitnessRAGRetriever:
             for doc, score in results:
                 key = _md5(doc.page_content)
                 if key in doc_map:
-                    _, acc_score = doc_map[key]
-                    doc_map[key] = (doc, acc_score + w * score)
+                    d0, acc, best, paths = doc_map[key]
+                    doc_map[key] = (d0, acc + w * score, max(best, score),
+                                    paths | {path_idx})
                 else:
-                    doc_map[key] = (doc, w * score)
+                    doc_map[key] = (doc, w * score, score, {path_idx})
 
         # 过滤 & 排序
+        #
+        # ⚠️ 过滤看**单路原始分**，不看加权分。
+        # 原实现用加权分过滤（`score >= threshold`），而 Σw = 1.0 且 threshold(0.20)
+        # 恰好等于最小路由权重 → 结构上就注定了权重最低那一路**连满分文档都过不了**：
+        #     有效门槛 = threshold / w_route      普通 0.50 | 单伤病 0.667 | 复合 1.00
+        # 复合伤病（w_milvus=0.20）要求余弦 ≥ 1.00，即**向量路永远被丢弃**——实测
+        # Milvus 返回 0.576/0.559/0.527 的高相关内容（招财猫咪/侧向伸展/靠墙天使）
+        # 全部被丢，融合结果 5/5 只有图谱。单伤病下同样丢了
+        # 0.536「缓解腰部紧张的 6 个方法」这类恰好对口的内容。
+        #
+        # 语义澄清：threshold 是「**有来源认为它相关吗**」的地板（过滤噪声用），
+        # 加权分是「**几路都认可**」的排序信号。把后者当前者用，等于因为「只有一路
+        # 找到它」就判定它不相关——一路高置信命中不该被这么对待。
+        # 原始分兜底**只对向量路开放**，且用独立的相关性地板：
+        #   通过条件 = 加权分 ≥ threshold（多路认可）  或
+        #              被向量路命中 且 余弦 ≥ VECTOR_RAW_FLOOR（该路自身强相关）
+        # 为什么只给向量路：
+        #   - BM25 的分被归一化成「本条最高 = 1.0」，是**相对量**，固定地板对它没意义
+        #   - 图谱分已由加权阈值覆盖（w_neo4j ≥ 0.20 ⇒ 有效地板 ≤ 0.44，够用）
+        #   - 只有向量路的余弦是**绝对量**，且它恰是权重最低的那路（0.20~0.40），
+        #     加权后被压得最狠 → 原实现下复合伤病问句的有效门槛是 1.00（永远不通过）
         merged = [
             (doc, score)
-            for doc, score in doc_map.values()
+            for doc, score, best_raw, paths in doc_map.values()
             if score >= self.threshold
+            or (0 in paths and best_raw >= VECTOR_RAW_FLOOR)
         ]
 
         # 语义去重（FUSION_SEMANTIC_DEDUP_ENABLED 默认关——开启会对全部候选做
