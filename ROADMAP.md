@@ -17,7 +17,7 @@
 | 知识库清理 | `fitness_data.csv` 72 → 62 行（移除 10 行混入的架构笔记） | 索引残留 0 条 |
 | 索引重建 | Milvus 271 chunk，`entity_labels` 完整 | 实测抽样确认 |
 | 评测落盘 | `eval_results/latest.json`（含配置/git commit/逐样本明细） | 全量 100 条跑通 |
-| 全量评测 | Hit@1/3/5 = 0.79 / 0.91 / 0.95，MRR 0.851 | 2026-09-10 |
+| 全量评测（重跑） | Hit@1/3/5 = **0.83 / 0.91 / 0.95**，MRR **0.872**；RAGAS 忠实度 0.51 / 相关性 0.93 / 上下文精度 0.73 / 召回 0.63 | 2026-09-10 22:16，commit 42d147b |
 
 **已修复的 5 个 bug**（详见 [INTERVIEW_STORIES.md](INTERVIEW_STORIES.md)）：
 1. `CSVLoader` 未传 `metadata_columns` → 图谱缺 3 种关系（0 条）+ `entity_labels` 全空
@@ -29,6 +29,16 @@
 **另外两个（2026-09-10 补修）**：
 6. `_run_fact_check` 未接收 `user_profile` → 缓存 key 与快速路径口径不一致，跨画像串用答案（已加回归测试）
 7. 阶段 D 重排在 HyDE 路径下冗余（ctx 已在 `similarity_search` 内重排过）→ 每请求浪费一次 LLM 调用
+
+**评测口径修正（2026-09-10 晚，核对简历数字时发现）**：
+- 旧的 `latest.json`（13:04）对应 commit `c5a8ce0`，而 `retriever.py`（图谱评分 / LIMIT 截断）
+  与 `build_index.py`（切块）在那之后都改过，**索引重建（14:20）还发生在评测（13:04）之后**
+  → 那份数字对应的代码在仓库里找不回来，已重跑（22:16，commit `42d147b`）
+- 重跑后 **「单伤病 + 复合伤病两类 Hit@3 均满分」不再成立**：单伤病 0.96（24/25），
+  复合伤病仍 1.00。两次独立重跑都是 0.96 → 不是噪声
+- 实测**跑动噪声约 ±1 个百分点**（Hit@1 0.82→0.83、Hit@5 0.96→0.95），
+  100 条样本里逐样本命中排名变动 2 条。**引用这些数字时不应精确到小数点后两位**
+- 修了 `eval_testset.py` 的 `git_dirty` 假阳性（详见 [INTERVIEW_STORIES.md](INTERVIEW_STORIES.md) 故事 25）
 
 ---
 
