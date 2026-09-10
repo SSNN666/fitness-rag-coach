@@ -55,3 +55,5 @@ Thumbs.db
 
 # uv 缓存（uv.lock 必须入库：CI `uv sync --frozen` 依赖它与 pyproject 同步）
 .uv/
+# 数据清理备份（本地保留，不入库）
+*.bak

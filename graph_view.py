@@ -94,10 +94,15 @@ def _load_from_neo4j() -> dict | None:
     except Exception:
         return None  # 图谱不可用 → 调用方回退本地副本
 
+    # 别名归一：与 _load_from_local 口径一致（图谱按 contra_data 原键建节点，
+    # 「腰突」与「腰间盘突出」会同时存在 → 不归一会显示成两个重复伤病节点）
+    from contra_data import INJURY_ALIASES
+
     edges: dict[tuple[str, str], set[str]] = {}
     for rec in records:
         if rec["injury"] and rec["action"]:
-            edges.setdefault((rec["injury"], rec["action"]), set()).add(rec["relation"] or "关联")
+            canon = INJURY_ALIASES.get(rec["injury"], rec["injury"])
+            edges.setdefault((canon, rec["action"]), set()).add(rec["relation"] or "关联")
     return _assemble(edges)
 
 

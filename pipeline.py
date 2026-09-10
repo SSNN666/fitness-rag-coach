@@ -304,7 +304,12 @@ class PipelineService:
         self._stage(on_stage, "检索完成，正在校验回答依据…")
 
         # ===== 阶段 D（锁外）：LLM 重排 + CRAG 联网 + grounding 判定（云端/网络无共享状态）=====
-        if tier_cfg["rerank"] and scored_docs:
+        # ⚠️ 仅在「无 HyDE 草稿」时重排。有草稿时 ctx 来自 hyde_retrieve，而它内部的
+        # similarity_search 已经对每路草稿重排过（use_rerank 默认 True）——此处再排一次，
+        # 重排的却是另一组文档（use_rerank=False 的直接检索结果），且该组只用于 grounding，
+        # 属于纯浪费（injury/plan 层每请求多一次 LLM 调用）。
+        # 无草稿（HyDE 失败降级）时，ctx 直接来自未重排的检索，此处的重排才是唯一一次。
+        if tier_cfg["rerank"] and scored_docs and not drafts:
             scored_docs = self._retriever.rerank(
                 question, scored_docs,
                 top_k=tier_cfg.get("context_docs", CONTEXT_DOCS_MAX))
@@ -431,7 +436,7 @@ class PipelineService:
             tier=tier, deep_thinking=deep_thinking,
             base_llm=base_llm, chat_llm=chat_llm, messages=messages,
             cite_docs=cite_docs, entities=entities, crag_raw=crag_raw,
-            tool_results=tool_results,
+            tool_results=tool_results, user_profile=user_profile,
             on_stage=on_stage, on_delta=on_delta,
             unfounded=unfounded, stop_event=stop_event,
         )
@@ -455,6 +460,7 @@ class PipelineService:
         base_llm = gen["base_llm"]
         chat_llm = gen["chat_llm"]
         messages = gen["messages"]
+        user_profile = gen.get("user_profile")
 
         # ---- Step 9: 降级链生成（云 → 本地）----
         self._stage(gen.get("on_stage"), "正在生成回答…")
@@ -523,6 +529,7 @@ class PipelineService:
             answer = self._run_fact_check(question, answer, ctx, contra_text, forbidden,
                                           deep_thinking=gen.get("deep_thinking", False),
                                           tool_results=gen.get("tool_results"),
+                                          user_profile=user_profile,
                                           request_id=rid)
 
         # 复杂层快速模式答后提示（用户可开深度思考重问；simple 层不提示）
@@ -606,8 +613,12 @@ class PipelineService:
         if not injury_names:
             return {}, [], "（当前查询无伤病，无需禁忌约束）", False
         contra_map = self._retriever.get_contraindications(injury_names)
-        if not contra_map and not NEO4J_ENABLED:
-            # 本地降级：图谱停机时用内置禁忌数据副本（核心安全数据不依赖单一外部服务）
+        if not contra_map:
+            # 本地降级：图谱未命中/停机时用内置禁忌数据副本
+            # （核心安全数据不依赖单一外部服务）
+            # ⚠️ 条件只看「图谱是否返回数据」，不看 NEO4J_ENABLED：
+            #    前者只覆盖“配置关闭”，图谱“已启用但运行时挂掉”时降级会失效 →
+            #    禁忌黑名单为空 → 边界拒绝与硬过滤同时失守（安全网消失）。
             contra_map = self._local_contraindications(injury_names)
         if contra_map:
             forbidden = list({a for acts in contra_map.values() for a in acts})
@@ -759,13 +770,19 @@ class PipelineService:
                         contraindications: str, forbidden_actions: list[str],
                         deep_thinking: bool = False,
                         tool_results: list | None = None,
+                        user_profile: str | None = None,
                         request_id: str | None = None) -> str:
-        """事实校验：缓存 → 小模型四类校验 → 失败走 CRAG 修正。任何环节异常不阻断。"""
+        """事实校验：缓存 → 小模型四类校验 → 失败走 CRAG 修正。任何环节异常不阻断。
+
+        ⚠️ user_profile 必须与生成前快速路径（见 answer() 内缓存快速路径）传同一口径：
+        工具触发时缓存 key 会追加画像指纹，漏传会导致「同问题不同画像」串用旧答案
+        （原缺陷：此处两处调用均未传 user_profile，而快速路径传了）。
+        """
         # 1. 查缓存（key 含模式维度；生成前已有快速路径，此处兜底）
         if self._fact_cache is not None:
             cached = self._fact_cache.get(
                 question, self._cache_key_entities(question, deep_thinking,
-                                                   tool_results))
+                                                   tool_results, user_profile))
             if cached:
                 return cached
 
@@ -777,7 +794,7 @@ class PipelineService:
             if self._fact_cache is not None:
                 self._fact_cache.set(
                     question, answer, self._cache_key_entities(question, deep_thinking,
-                                                               tool_results))
+                                                               tool_results, user_profile))
             return answer
 
         # 3. 校验失败 → CRAG 联网修正（降级链生成）
@@ -808,7 +825,7 @@ class PipelineService:
         if self._fact_cache is not None:
             self._fact_cache.set(
                 question, answer, self._cache_key_entities(question, deep_thinking,
-                                                           tool_results))
+                                                           tool_results, user_profile))
         return answer
 
     _SENT_END = re.compile(r"[。！？；!?;]")

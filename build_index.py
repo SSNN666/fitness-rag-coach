@@ -112,7 +112,19 @@ def build():
     # 1. 加载数据源
     # ================================================================
     # 1a. CSV 动作库
-    loader = CSVLoader(file_path=CSV_FILE, encoding="utf-8")
+    # ⚠️ 必须显式传 metadata_columns：langchain_community CSVLoader 默认
+    # metadata_columns=()，列不进 metadata（只有 source/row），导致下游
+    # _extract_entity_labels / _build_neo4j 读 metadata["动作名称"] 等全部落空。
+    # ⚠️ 必须同时传 content_columns：一旦指定 metadata_columns，这些列会从
+    # page_content 中被移除（实测），动作名称/肌群/器械就进不了 BM25 与向量索引，
+    # 检索质量崩塌。显式列全 → page_content 与默认行为逐字节一致。
+    _CSV_COLUMNS = ["动作名称", "目标肌群", "器械", "难度", "步骤", "注意事项"]
+    loader = CSVLoader(
+        file_path=CSV_FILE,
+        encoding="utf-8",
+        metadata_columns=["动作名称", "目标肌群", "器械", "难度"],
+        content_columns=_CSV_COLUMNS,
+    )
     raw_docs = loader.load()
     csv_count = len(raw_docs)
 

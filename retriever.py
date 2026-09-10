@@ -482,14 +482,17 @@ class FitnessRAGRetriever:
     }
 
     @staticmethod
-    def _relation_label(relation: str, desc: str) -> str:
-        """从关系类型名或描述中提取完整标签（禁忌动作/康复动作/谨慎动作）。
+    def _relation_label(relation: str, desc: str, rel_prop: str = "") -> str:
+        """从关系类型名、关系属性或描述中提取完整标签（禁忌动作/康复动作/谨慎动作）。
 
-        图谱数据源两种落点都兼容：标签在关系类型（type(r)）或描述（r.description）。
+        图谱数据源三种落点都兼容：
+          - rel_prop：关系属性 r.relation —— **真实图谱的实际落点**（build_index 写入）
+          - relation：关系类型 type(r) —— mock 图谱（eval_graph.py）的落点
+          - desc：描述文本（兜底）
         查不到时返回原始描述（默认分数 0.5 语义）。
         """
         for lbl in ("禁忌动作", "康复动作", "谨慎动作"):
-            if lbl in (relation or "") or lbl in (desc or ""):
+            if lbl in (rel_prop or "") or lbl in (relation or "") or lbl in (desc or ""):
                 return lbl
         return desc or relation
 
@@ -507,17 +510,19 @@ class FitnessRAGRetriever:
         if not all_names:
             return []
 
+        # 注意：不在 Cypher 里 LIMIT —— 无 ORDER BY 的 LIMIT 会在打分前任意截断，
+        # 高分禁忌路径可能被静默丢弃；改为取回全部后在 Python 内排序再截断。
         cypher = """
             MATCH (e:Entity)-[r]->(n:Entity)
             WHERE e.name IN $names
             RETURN e.name AS src, e.type AS src_type,
                    type(r) AS relation, r.description AS rel_desc,
+                   r.relation AS rel_prop,
                    n.name AS target, n.type AS target_type
-            LIMIT $limit
         """
         try:
             records, _, _ = self._neo4j.execute_query(
-                cypher, {"names": all_names, "limit": k},
+                cypher, {"names": all_names},
                 database_=NEO4J_DATABASE,
             )
         except Exception:
@@ -525,7 +530,8 @@ class FitnessRAGRetriever:
 
         out = []
         for rec in records:
-            rel_label = self._relation_label(rec.get("relation", ""), rec.get("rel_desc", ""))
+            rel_label = self._relation_label(
+                rec.get("relation", ""), rec.get("rel_desc", ""), rec.get("rel_prop", ""))
             text = (
                 f"[图谱] {rec['src']}({rec['src_type']}) "
                 f"--[{rel_label}]--> {rec['target']}({rec['target_type']})"
@@ -542,8 +548,9 @@ class FitnessRAGRetriever:
                                                         "entity_labels": labels,
                                                         "relation": rel_label})
             out.append((doc, score))
-        out.sort(key=lambda x: x[1], reverse=True)   # 先排序再截断（调用方 fusion 前就取 top-k）
-        return out
+        # 先排序再截断：截断必须发生在打分之后（Cypher 侧 LIMIT 已移除）
+        out.sort(key=lambda x: x[1], reverse=True)
+        return out[:k]
 
     # ----------------------------------------------------------------
     # 多跳查询（核心新增）
@@ -568,6 +575,7 @@ class FitnessRAGRetriever:
             RETURN start.name AS src, start.type AS src_type,
                    [rel in relationships(path) | type(rel)] AS relations,
                    [rel in relationships(path) | coalesce(rel.description, '')] AS rel_descs,
+                   [rel in relationships(path) | coalesce(rel.relation, '')] AS rel_props,
                    [node in nodes(path) | node.name] AS path_nodes,
                    [node in nodes(path) | node.type] AS node_types,
                    length(path) AS hops
@@ -603,13 +611,18 @@ class FitnessRAGRetriever:
             # 评分：关系标签基础分（禁忌1.0/康复0.9/谨慎0.7/默认0.5）× 深度衰减（hop 越浅越高）；
             # 含禁忌关系路径额外 boost（类型名/描述双源匹配）
             relations = rec.get("relations", []) or []
+            rel_props = rec.get("rel_props", []) or []
             # 末段关系即指向目标动作的关系（供 _merge_conflicts 冲突检测；标签归一）
             rel_label = self._relation_label(
-                relations[-1] if relations else "", rel_descs[-1] if rel_descs else "")
+                relations[-1] if relations else "",
+                rel_descs[-1] if rel_descs else "",
+                rel_props[-1] if rel_props else "")
             tag_score = self._RELATION_SCORE.get(rel_label, 0.5)
             base_score = tag_score / hops
-            has_contraind = any("禁忌" in (d or "") for d in rel_descs) or \
-                any("禁忌" in (r or "") for r in relations)
+            # 三源检测：关系属性（真实图谱）> 关系类型（mock）> 描述（兜底）
+            has_contraind = any("禁忌" in (p or "") for p in rel_props) or \
+                any("禁忌" in (r or "") for r in relations) or \
+                any("禁忌" in (d or "") for d in rel_descs)
             if has_contraind:
                 base_score = min(1.0, base_score * NEO4J_PATH_BOOST_CONTRAIND)
 

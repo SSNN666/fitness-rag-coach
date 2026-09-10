@@ -147,6 +147,69 @@ def cosine(a, b):
 # th=0.75 → Hit@3=0.00（黄金对 query↔ref 平均 0.774，doc↔ref 更低一档）。切换 Embedding 供应商必须重校准此值。
 SIM_THRESHOLD = 0.60
 
+# 逐样本明细累积（落盘用：聚合指标要能追溯到具体问题）
+SAMPLE_RECORDS: list[dict] = []
+
+
+def save_results(retrieval: dict, ragas_scores: dict, type_results: dict) -> str:
+    """把评测结果落盘 —— 让 README / 简历上的每个数字都可追溯、可复现。
+
+    记录完整运行上下文（模式 / 融合方式 / 嵌入模型 / 评测集 / commit），
+    否则数字离开当次终端就失去可信度（历史教训：头条指标无产物可查）。
+    """
+    import datetime
+    import subprocess
+
+    out_dir = "eval_results"
+    os.makedirs(out_dir, exist_ok=True)
+
+    try:
+        commit = subprocess.run(
+            ["git", "rev-parse", "--short", "HEAD"],
+            capture_output=True, text=True, timeout=5,
+        ).stdout.strip()
+        # 工作区有未提交改动时标注：否则 commit 号无法代表产生结果的代码
+        dirty = bool(subprocess.run(
+            ["git", "status", "--porcelain"],
+            capture_output=True, text=True, timeout=5,
+        ).stdout.strip())
+    except Exception:
+        commit, dirty = "", False
+
+    payload = {
+        "meta": {
+            "timestamp": datetime.datetime.now().isoformat(timespec="seconds"),
+            "eval_mode": EVAL_MODE,
+            "provider": EVAL_PROVIDER,
+            "fusion_mode": FUSION_MODE,
+            "use_hyde": USE_HYDE,
+            "use_rrf": USE_RRF,
+            "neo4j_enabled": NEO4J_ENABLED,
+            "embedding_provider": EMBEDDING_PROVIDER,
+            "embedding_model": (EMBEDDING_CLOUD_MODEL if EMBEDDING_PROVIDER == "cloud"
+                                else EMBEDDING_MODEL),
+            "sim_threshold": SIM_THRESHOLD,
+            "testset": "test_100_full.csv",
+            "n_samples": len(df),
+            "git_commit": commit,
+            "git_dirty": dirty,   # True = 工作区有未提交改动，结果对应的是工作区代码
+        },
+        "metrics": {**retrieval, **ragas_scores},
+        "by_question_type": type_results,
+        "samples": SAMPLE_RECORDS,
+    }
+
+    ts = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+    path = os.path.join(out_dir, f"eval_{ts}.json")
+    for p in (path, os.path.join(out_dir, "latest.json")):
+        with open(p, "w", encoding="utf-8") as f:
+            json.dump(payload, f, ensure_ascii=False, indent=2)
+
+    print(f"\n[SAVED] 结果已落盘: {path}")
+    print(f"[SAVED] 最新指针:   {out_dir}/latest.json")
+    return path
+
+
 def compute_retrieval_metrics():
     k_list = (1, 3, 5)
     hit = {k: 0 for k in k_list}
@@ -165,6 +228,15 @@ def compute_retrieval_metrics():
             for k in k_list:
                 if any(r <= k for r in ranks):
                     hit[k] += 1
+        # 逐样本明细：让每个聚合指标都能追溯到具体问题（落盘用）
+        SAMPLE_RECORDS.append({
+            "query": row["query"],
+            "question_type": row.get("question_type", ""),
+            "hit_ranks": ranks,
+            "first_hit_rank": ranks[0] if ranks else None,
+            "n_docs": len(docs),
+            "retrieved_sources": [d.metadata.get("source", "") for d in docs],
+        })
         if (i + 1) % 20 == 0:
             print(f"  retrieval... {i+1}/{len(df)}")
             gc.collect()
@@ -433,6 +505,9 @@ if not SKIP_GROUPS:
 else:
     type_results = {}
     print("\n[INFO] 跳过分组统计 (--skip-groups)")
+
+# -- 落盘（先存后印：终端输出丢失也不影响结果可追溯）-----------------
+save_results(retrieval, ragas_scores, type_results)
 
 # -- 汇总输出 ----------------------------------------------
 print("\n" + "=" * 70)

@@ -414,6 +414,54 @@ def test_cache_key_profile_fingerprint_when_tools_triggered():
     assert k0 == PipelineService._cache_key_entities("帮我算下BMI", False, None, None)
 
 
+def test_fact_check_uses_same_cache_key_as_fast_path():
+    """回归：_run_fact_check 的缓存 key 必须与生成前快速路径同口径（含画像指纹）。
+
+    原缺陷：_run_fact_check 未接收 user_profile，工具触发时写入的缓存不含画像指纹，
+    而生成前快速路径的 key 含指纹 → 两者错位，导致「同问题不同画像」串用旧答案
+    （实测路径：A 的身高体重算出的 BMI 被 B 命中）。
+    """
+    from health_tools import ToolResult
+
+    class _RecordingCache:
+        """只记录 key，不做真实存取。"""
+
+        def __init__(self):
+            self.keys = []
+
+        def get(self, question, key):
+            self.keys.append(key)
+            return None
+
+        def set(self, question, answer, key):
+            self.keys.append(key)
+
+    class _PassingEngine:
+        def check(self, *a, **kw):
+            class _R:
+                passed = True
+            return _R()
+
+    class _StubRetriever:
+        def get_contraindications(self, names):
+            return {}
+
+    cache = _RecordingCache()
+    svc = PipelineService(retriever=_StubRetriever(), llms={}, gateway=None,
+                          fact_engine=_PassingEngine(), fact_cache=cache, store={})
+    tools = [ToolResult(name="calculate_bmi", title="BMI 计算", content="x")]
+    profile = "身高170cm，体重70kg"
+
+    svc._run_fact_check("帮我算下BMI", "你的 BMI 是 24.2", "ctx", "", [],
+                        tool_results=tools, user_profile=profile)
+
+    expected = PipelineService._cache_key_entities(
+        "帮我算下BMI", False, tools, profile)
+    assert cache.keys, "未发生缓存读写"
+    assert all(k == expected for k in cache.keys), (
+        f"fact-check 缓存 key 与快速路径口径不一致：\n{cache.keys}\n!= {expected}")
+
+
 def test_rewrite_used_for_retrieval(monkeypatch):
     """多轮指代问句（非禁忌动作）→ 改写后的 retrieval_q 用于检索；原 question 仍进 Prompt。"""
     import pipeline as pipeline_mod
