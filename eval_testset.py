@@ -151,11 +151,16 @@ SIM_THRESHOLD = 0.60
 SAMPLE_RECORDS: list[dict] = []
 
 
-def save_results(retrieval: dict, ragas_scores: dict, type_results: dict) -> str:
+def save_results(retrieval: dict, ragas_scores: dict, type_results: dict,
+                 partial: bool = False) -> str:
     """把评测结果落盘 —— 让 README / 简历上的每个数字都可追溯、可复现。
 
     记录完整运行上下文（模式 / 融合方式 / 嵌入模型 / 评测集 / commit），
     否则数字离开当次终端就失去可信度（历史教训：头条指标无产物可查）。
+
+    partial=True 表示这是在 RAGAS 阶段之前先落一次盘的中间结果
+    （检索指标已算完但 RAGAS 未跑）——RAGAS 阶段耗时长且实测卡过，
+    不先存的话卡死会导致已完成的检索指标一起丢失。
     """
     import datetime
     import subprocess
@@ -193,6 +198,7 @@ def save_results(retrieval: dict, ragas_scores: dict, type_results: dict) -> str
             "n_samples": len(df),
             "git_commit": commit,
             "git_dirty": dirty,   # True = 工作区有未提交改动，结果对应的是工作区代码
+            "partial": partial,   # True = 仅检索指标（RAGAS 阶段前先存的中间结果）
         },
         "metrics": {**retrieval, **ragas_scores},
         "by_question_type": type_results,
@@ -201,12 +207,19 @@ def save_results(retrieval: dict, ragas_scores: dict, type_results: dict) -> str
 
     ts = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
     path = os.path.join(out_dir, f"eval_{ts}.json")
-    for p in (path, os.path.join(out_dir, "latest.json")):
-        with open(p, "w", encoding="utf-8") as f:
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump(payload, f, ensure_ascii=False, indent=2)
+
+    # latest.json 只指向「完整跑」：中间结果（partial）不该覆盖权威指针，
+    # 否则一次被中断的评测会让 latest 指向只有检索指标的半成品。
+    if not partial:
+        with open(os.path.join(out_dir, "latest.json"), "w", encoding="utf-8") as f:
             json.dump(payload, f, ensure_ascii=False, indent=2)
 
-    print(f"\n[SAVED] 结果已落盘: {path}")
-    print(f"[SAVED] 最新指针:   {out_dir}/latest.json")
+    tag = "（中间结果·仅检索指标）" if partial else ""
+    print(f"\n[SAVED] 结果已落盘: {path}{tag}")
+    if not partial:
+        print(f"[SAVED] 最新指针:   {out_dir}/latest.json")
     return path
 
 
@@ -492,6 +505,8 @@ print("\n[1/2] Computing Hit@k / MRR ...")
 t0 = time.time()
 retrieval = compute_retrieval_metrics()
 print(f"  [TIME] {time.time()-t0:.1f}s")
+# 先落一次盘：RAGAS 阶段耗时长且实测卡过，卡死时已算完的检索指标不该一起丢
+save_results(retrieval, {}, {}, partial=True)
 
 print("\n[INFO] [2/2] 计算 RAGAS 指标（LLM-as-Judge，100条 × 5轮推理）...")
 t0 = time.time()

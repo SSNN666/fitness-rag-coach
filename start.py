@@ -11,6 +11,8 @@ start.py —— 一键启动（API 后端 + Streamlit UI）
 双击 start.bat 等价于在项目目录执行 python start.py。
 
 设计要点:
+  - Neo4j 图谱容器预检（NEO4J_ENABLED 时）：容器无 --restart，重启电脑后不会自启
+    → 此处自动拉起；docker 不可用/容器不存在只提示不阻断（图谱有降级逻辑）
   - 启动顺序 API → UI（UI 是纯 SSE 客户端，先起后端避免冷启动空窗）
   - 健康检查等就绪（API healthz 最长 120s，pipeline/Milvus/适配器初始化需要时间）
   - 端口占用预检：已有实例在跑时给出提示而不是撞端口报错
@@ -57,6 +59,53 @@ def _port_busy(port: int) -> bool:
         return s.connect_ex(("127.0.0.1", port)) == 0
 
 
+NEO4J_CONTAINER = "neo4j-fitness"
+
+
+def _ensure_neo4j() -> None:
+    """确保本地 Neo4j 容器在运行（仅 NEO4J_ENABLED 时）。
+
+    为什么需要：容器创建时未设 --restart，**重启电脑后不会自动起来** →
+    图谱页空白、三路检索静默退化成双路。演示前忘记拉起的代价很直接。
+
+    失败不阻断启动：项目自身有图谱降级（禁忌数据走 contra_data 本地副本），
+    docker 缺失/容器不存在都只提示不报错。
+    """
+    try:
+        from config import NEO4J_ENABLED
+    except Exception:
+        return
+    if not NEO4J_ENABLED:
+        return
+
+    def _docker(*argv: str):
+        return subprocess.run(["docker", *argv], capture_output=True,
+                              text=True, timeout=20)
+
+    try:
+        r = _docker("inspect", "-f", "{{.State.Running}}", NEO4J_CONTAINER)
+        if r.returncode != 0:
+            print(f"[!] 未找到 Neo4j 容器 {NEO4J_CONTAINER}，"
+                  f"图谱将降级（禁忌数据自动走 contra_data 本地副本）")
+            return
+        if r.stdout.strip() == "true":
+            print(f"[0/3] Neo4j 容器已在运行 ✓")
+            return
+
+        print(f"[0/3] 启动 Neo4j 容器 {NEO4J_CONTAINER} ...")
+        _docker("start", NEO4J_CONTAINER)
+        for _ in range(30):
+            if _port_busy(7687):
+                print("      Neo4j 就绪 ✓")
+                return
+            time.sleep(1)
+        print("[!] Neo4j 启动后 30s 内未监听 7687，图谱可能不可用")
+    except FileNotFoundError:
+        print("[!] 未检测到 docker 命令，跳过 Neo4j 检查（图谱将降级）")
+    except Exception as e:  # 超时/权限等一律不阻断主流程
+        print(f"[!] Neo4j 检查异常（已忽略，不影响其他服务）: {e}")
+
+
 def main() -> None:
     ap = argparse.ArgumentParser(description="一键启动康养 RAG（API + Streamlit UI）")
     ap.add_argument("--no-browser", action="store_true", help="启动后不自动打开浏览器")
@@ -64,6 +113,9 @@ def main() -> None:
     ap.add_argument("--port-api", type=int, default=8000)
     ap.add_argument("--port-ui", type=int, default=8501)
     args = ap.parse_args()
+
+    # ---- 0. Neo4j 图谱容器（未运行则自动拉起，失败不阻断）----
+    _ensure_neo4j()
 
     # 端口预检：已有健康实例时跳过本次启动（避免撞端口报错 / 重复拉起）
     if not args.skip_api and _port_busy(args.port_api):
