@@ -37,7 +37,7 @@ from config import *
 from crag_search import build_search_query, format_search_results, search_fitness, crag_retrieve
 from gateway import Gateway, GatewayConfig
 from grounding import assess_grounding, refusal_message
-from health_tools import run_health_tools
+from health_tools import resolve_health_tools
 from hyde import generate_hyde_drafts, hyde_retrieve, needs_rewrite, rewrite_query
 from llm_adapter import FallbackChain, build_embeddings, build_llm, to_runnable
 from retriever import FitnessRAGRetriever, load_bm25_from_pickle
@@ -363,19 +363,34 @@ class PipelineService:
         if self._cancelled(stop_event):
             return result
 
+        # ===== 工具决策（锁外）：模型自主调用 tools 协议，关键词兜底 =====
+        # 放锁外：模型调用是网络 IO，进锁会阻塞并发请求的检索段（Milvus 串行）。
+        # 且仅当能抽到身高/体重/年龄时才发起——参数全无时任何工具都算不出来，
+        # 多打一次 LLM 纯属浪费（这也是把模型调用限制在少数请求上的关键）。
+        tool_results: list = []
+        tool_source = "none"
+        if HEALTH_TOOLS_ENABLED:
+            try:
+                _router = (self._llms.get("tool_router")
+                           if HEALTH_TOOLS_MODEL_DECISION else None)
+                tool_results, tool_source = resolve_health_tools(
+                    question, user_profile, _router)
+            except Exception:
+                tool_results, tool_source = [], "none"
+        if tool_results:
+            self._gateway.log_cycle("tool_call", request_id=rid,
+                                    source=tool_source,
+                                    tools=[t.name for t in tool_results])
+        if self._cancelled(stop_event):
+            return result
+
         # ===== 阶段 E（锁内）：Prompt 组装 + 令牌预算（裁剪 store）+ 缓存快速路径 =====
         with self._lock:
-            # 确定性健康工具：参数齐全且关键词命中 → 结果注入上下文顶部
-            # （位于令牌预算守卫之前：头部位置不会被尾部截断误伤；纯本地 ~0.1ms）
-            tool_results: list = []
-            if HEALTH_TOOLS_ENABLED:
-                try:
-                    tool_results = run_health_tools(question, user_profile)
-                except Exception:
-                    tool_results = []
-                if tool_results:
-                    tool_ctx = "\n".join(f"- [{t.title}] {t.content}" for t in tool_results)
-                    ctx = f"[工具计算结果]\n{tool_ctx}\n\n{ctx}"
+            # 工具计算结果注入上下文顶部
+            # （位于令牌预算守卫之前：头部位置不会被尾部截断误伤）
+            if tool_results:
+                tool_ctx = "\n".join(f"- [{t.title}] {t.content}" for t in tool_results)
+                ctx = f"[工具计算结果]\n{tool_ctx}\n\n{ctx}"
 
             system_prompt = self._select_prompt(question)
             if contra_text and "暂无" not in contra_text and "无需" not in contra_text:
@@ -1036,6 +1051,8 @@ def build_pipeline() -> PipelineService:
         "chat_nothink": build_llm("chat_nothink"),                      # 复杂层默认快速（plus 关思考）
         "chat_fast": build_llm("chat_fast"),                            # 分层策略：simple 查询快模型
         "hyde": build_llm("hyde", on_usage=_bg_usage),
+        # 工具路由：仅产出 tool_calls（无正文），走小模型短预算
+        "tool_router": build_llm("tool_router", on_usage=_bg_usage),
     }
 
     fact_engine = None

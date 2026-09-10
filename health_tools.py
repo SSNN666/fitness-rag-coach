@@ -135,7 +135,7 @@ TOOL_REGISTRY = [
 def run_health_tools(question: str, user_profile: str | None = None) -> list[ToolResult]:
     """关键词命中且参数齐全 → 返回计算结果列表；无命中/缺参数 → []。
 
-    纯本地字符串处理（~0.1ms），pipeline 锁内调用安全。
+    纯本地字符串处理（~0.1ms）。作为**兜底路径**保留：模型决策不可用时使用。
     """
     params = _extract_params(question, user_profile)
     if not params:
@@ -148,3 +148,83 @@ def run_health_tools(question: str, user_profile: str | None = None) -> list[Too
             if r is not None:
                 results.append(r)
     return results
+
+
+# ============================================================
+# 模型自主工具调用（tools 协议）
+# ============================================================
+# ⚠️ 关键设计：**参数不由模型提供**。
+#    身高/体重/年龄一律走 _extract_params 的确定性抽取；模型只负责
+#    「该不该算、算哪一个」。理由：健康数值必须可复现、可审计——
+#    让模型「填」身高体重等于允许它编造输入，算出来的 BMI 再准也是假的。
+#    这是比「把参数交给模型」更强的一个安全设计，也是可讲的取舍。
+
+TOOL_DESCRIPTIONS = {
+    "calculate_bmi": "根据身高与体重计算 BMI，并给出中国成人分档（偏瘦/正常/超重/肥胖）。"
+                     "当用户询问自己胖不胖、体重是否标准、或明确要算 BMI 时调用。",
+    "estimate_water_intake": "根据体重估算每日建议饮水量。"
+                             "当用户询问每天该喝多少水、如何补水时调用。",
+    "heart_rate_zone": "根据年龄计算最大心率与燃脂/有氧心率区间。"
+                       "当用户询问运动时心率多少合适、靶心率、燃脂区间时调用。",
+}
+
+
+def tool_definitions() -> list[dict]:
+    """TOOL_REGISTRY → OpenAI tools 协议定义（供模型决定调用哪个工具）。"""
+    defs = []
+    for t in TOOL_REGISTRY:
+        defs.append({
+            "type": "function",
+            "function": {
+                "name": t["name"],
+                "description": TOOL_DESCRIPTIONS.get(t["name"], t["title"]),
+                # 参数由服务端确定性抽取填入，故 schema 不声明必填项——
+                # 模型只需选择工具，不参与取值。
+                "parameters": {"type": "object", "properties": {}, "required": []},
+            },
+        })
+    return defs
+
+
+def execute_tool(name: str, params: dict) -> ToolResult | None:
+    """按名字执行工具。参数来自确定性抽取；参数不全 → None（跳过）。"""
+    for t in TOOL_REGISTRY:
+        if t["name"] == name:
+            return t["compute"](params)
+    return None
+
+
+def resolve_health_tools(question: str, user_profile: str | None, llm=None
+                         ) -> tuple[list[ToolResult], str]:
+    """解析本轮需要执行哪些健康工具：**模型决策优先，关键词兜底**。
+
+    Returns:
+        (results, source) —— source ∈ {"model", "keyword", "none"}，
+        供日志/引用标注，便于线上观测两条路径的实际占比。
+
+    仅在「能抽到参数」时才尝试模型决策：参数都没有时任何工具都无法计算，
+    多发一次 LLM 调用纯属浪费（这也是把模型调用限制在少数请求上的关键）。
+    """
+    params = _extract_params(question, user_profile)
+    if not params:
+        return [], "none"
+
+    if llm is not None:
+        try:
+            resp = llm.invoke(
+                [{"role": "user",
+                  "content": f"用户问题：{question}\n\n"
+                             f"若该问题需要精确的健康数值计算，请调用相应工具；"
+                             f"若只是泛泛讨论，不要调用。"}],
+                tools=tool_definitions(), tool_choice="auto",
+                temperature=0.0, max_tokens=128,
+            )
+            names = [tc.get("name") for tc in (resp.tool_calls or []) if tc.get("name")]
+            results = [r for r in (execute_tool(n, params) for n in names) if r is not None]
+            if results:
+                return results, "model"
+        except Exception:
+            pass  # 模型决策不可用（Ollama 不支持 tools / 超时等）→ 走关键词兜底
+
+    kw_results = run_health_tools(question, user_profile)
+    return kw_results, ("keyword" if kw_results else "none")

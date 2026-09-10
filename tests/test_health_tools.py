@@ -3,7 +3,9 @@ from health_tools import (
     TOOL_REGISTRY,
     ToolResult,
     _extract_params,
+    resolve_health_tools,
     run_health_tools,
+    tool_definitions,
 )
 
 
@@ -86,3 +88,83 @@ class TestRegistryShape:
     def test_tool_result_is_dataclass(self):
         r = ToolResult(name="x", title="y", content="z")
         assert r.name == "x" and r.title == "y" and r.content == "z"
+
+
+class TestModelDrivenToolCalling:
+    """模型自主决策调用工具（tools 协议）→ 失败/未命中时关键词兜底。"""
+
+    class _FakeLLM:
+        """只回 tool_calls 的假适配器，记录调用次数。"""
+
+        def __init__(self, tool_calls=None, raises=False):
+            self._tool_calls = tool_calls
+            self._raises = raises
+            self.calls = 0
+
+        def invoke(self, messages, **kw):
+            self.calls += 1
+            if self._raises:
+                raise RuntimeError("provider down")
+
+            class _R:
+                pass
+
+            r = _R()
+            r.tool_calls = self._tool_calls
+            return r
+
+    def test_model_decision_used_when_tool_called(self):
+        llm = self._FakeLLM([{"name": "calculate_bmi", "args": {}, "id": "1"}])
+        results, source = resolve_health_tools(
+            "帮我算下BMI", "身高170cm，体重70kg", llm)
+        assert source == "model"
+        assert len(results) == 1 and results[0].name == "calculate_bmi"
+        assert "24.2" in results[0].content      # 70/(1.7²)=24.2
+        assert llm.calls == 1
+
+    def test_model_picks_tool_that_keywords_would_miss(self):
+        """模型决策的增量价值：问法不含任何触发词，但模型能选对工具。"""
+        llm = self._FakeLLM([{"name": "estimate_water_intake", "args": {}, "id": "1"}])
+        results, source = resolve_health_tools(
+            "我每天该补充多少液体", "身高170cm，体重70kg", llm)   # 无「喝水/补水」类关键词
+        assert source == "model"
+        assert results and results[0].name == "estimate_water_intake"
+        # 对照：纯关键词路径在此问法下命中不了
+        assert run_health_tools("我每天该补充多少液体", "身高170cm，体重70kg") == []
+
+    def test_fallback_to_keyword_when_model_returns_no_tool_call(self):
+        llm = self._FakeLLM(None)
+        results, source = resolve_health_tools("帮我算下BMI", "身高170cm，体重70kg", llm)
+        assert source == "keyword"
+        assert results and results[0].name == "calculate_bmi"
+
+    def test_fallback_when_model_raises(self):
+        """模型不可用（Ollama 不支持 tools / 超时）→ 静默降级到关键词。"""
+        llm = self._FakeLLM(raises=True)
+        results, source = resolve_health_tools("帮我算下BMI", "身高170cm，体重70kg", llm)
+        assert source == "keyword"
+        assert results and results[0].name == "calculate_bmi"
+
+    def test_no_params_skips_model_call_entirely(self):
+        """参数全无 → 任何工具都算不出来，不该白白发起一次 LLM 调用。"""
+        llm = self._FakeLLM([{"name": "calculate_bmi", "args": {}, "id": "1"}])
+        results, source = resolve_health_tools("深蹲练什么肌肉", None, llm)
+        assert (results, source) == ([], "none")
+        assert llm.calls == 0
+
+    def test_params_come_from_extraction_not_model(self):
+        """关键设计：模型只选工具，参数一律走确定性抽取（不信任模型填的数值）。"""
+        llm = self._FakeLLM([{"name": "calculate_bmi",
+                              "args": {"height_cm": 200, "weight_kg": 200}, "id": "1"}])
+        results, _ = resolve_health_tools("帮我算下BMI", "身高170cm，体重70kg", llm)
+        assert "身高170cm" in results[0].content      # 用的是画像值，不是模型传的 200
+        assert "200" not in results[0].content
+
+    def test_tool_definitions_shape(self):
+        defs = tool_definitions()
+        names = {t["name"] for t in TOOL_REGISTRY}
+        assert len(defs) == len(names)
+        for d in defs:
+            assert d["type"] == "function"
+            assert d["function"]["name"] in names
+            assert d["function"]["description"]

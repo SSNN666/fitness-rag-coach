@@ -310,6 +310,8 @@ LLM_ROLES = {
     "fact_check":   {"dashscope": "qwen3.7-flash", "deepseek": "deepseek-chat", "qianfan": "ernie-4.5-turbo-32k", "ollama": "qwen2.5:1.5b", "temperature": 0.0, "max_tokens": 128, "thinking": False},
     "rerank":       {"dashscope": "qwen3.7-flash", "deepseek": "deepseek-chat", "qianfan": "ernie-4.5-turbo-32k", "ollama": "qwen2.5:7b", "temperature": 0.0, "max_tokens": 32, "thinking": False},
     "judge":        {"dashscope": "qwen3.7-flash", "deepseek": "deepseek-chat", "qianfan": "ernie-4.5-turbo-32k", "ollama": "qwen2.5:7b", "temperature": 0.0, "max_tokens": 8, "thinking": False},
+    # 工具路由：只决定「调哪个工具」，不产出正文 → 短预算小模型足够
+    "tool_router":  {"dashscope": "qwen3.7-flash", "deepseek": "deepseek-chat", "qianfan": "ernie-4.5-turbo-32k", "ollama": "qwen2.5:1.5b", "temperature": 0.0, "max_tokens": 128, "thinking": False},
     "vision":       {"dashscope": "qwen3-vl-plus-2025-12-19", "ollama": None, "temperature": 0.3, "max_tokens": 1024},
 }
 
@@ -401,6 +403,9 @@ OCR_QUALITY_RETRY_SIZE = 2400          # 乱码页提分辨率重试的降采样
 # 不让 LLM 自行算术；注册表结构可演进为 tools 协议）
 # ============================================================
 HEALTH_TOOLS_ENABLED = True
+# 工具调用机制：True = 模型自主决策调哪个工具（tools 协议），关键词触发降级兜底；
+# False = 仅关键词触发（旧行为，零额外 LLM 调用）
+HEALTH_TOOLS_MODEL_DECISION = True
 
 # ============================================================
 # 多轮查询改写（指代消解后检索：会话历史只进 messages 时，

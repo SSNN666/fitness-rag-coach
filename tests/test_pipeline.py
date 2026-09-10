@@ -364,10 +364,13 @@ def test_tool_results_injected_into_context(monkeypatch):
 
     monkeypatch.setattr(pipeline_mod, "REFUSE_ENABLED", False)   # 检索空路径不拒答
     monkeypatch.setattr(pipeline_mod, "HEALTH_TOOLS_ENABLED", True)
+    # resolve_health_tools 现签名为 (question, user_profile, llm=None) -> (results, source)
     monkeypatch.setattr(
-        pipeline_mod, "run_health_tools",
-        lambda q, p: [ToolResult(name="calculate_bmi", title="BMI 计算",
-                                 content="身高170cm、体重70kg → BMI=24.2，属超重")])
+        pipeline_mod, "resolve_health_tools",
+        lambda q, p, llm=None: (
+            [ToolResult(name="calculate_bmi", title="BMI 计算",
+                        content="身高170cm、体重70kg → BMI=24.2，属超重")],
+            "model"))
 
     stop = threading.Event()
     chat_fast = _CaptureChain(stop)
