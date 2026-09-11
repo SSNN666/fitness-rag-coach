@@ -413,3 +413,40 @@ INJURY_ALIASES: dict = {
     "髌骨": "髌骨软化",
     "梨状肌": "梨状肌综合征",
 }
+
+# ⚠️ 注意：`INJURY_ACTION_MAP` 里同时存在「腰突」与「腰间盘突出」两条，
+# 它们不是可以随手删掉的重复条目，**删之前请先读这段**（2026-09-11 核实）：
+#
+#   · 本地降级路径（`pipeline._local_contraindications`）里「腰突」确实**不可达**——
+#     该函数先做别名归一，而归一后的「腰间盘突出」并不含连续子串「腰突」
+#     （腰-间-盘-突-出），三个比较式全不成立 → 它的键不会出现在结果里。
+#   · **但图谱路径里它是活的**：`build_index` 按本表的键建 Entity 节点，于是
+#     Neo4j 里有一个 `(腰突:injury)` 节点（出边：深蹲/硬拉，均为禁忌动作）；
+#     而 `FitnessRAGRetriever._extract_entities` **不做别名归一**，
+#     「腰突怎么康复」原样产出 `{'injury': ['腰突']}` → 正是靠这个节点命中。
+#
+#   → 删掉它会让「腰突」这类问句的图谱检索在**重建图谱后**失效。
+#     真要合并，得先把别名归一补进实体抽取，那是检索改动，必须重新评测。
+
+
+def data_fingerprint() -> str:
+    """伤病/禁忌数据的**内容指纹**（8 位十六进制），供缓存键失效使用。
+
+    为什么不用手工版本号：`config.FACT_CACHE_VERSION` 跟踪的是**提示词**变更，
+    改本文件（增删禁忌）它不会动 → `fact_cache` 会继续吐按旧禁忌表生成的答案。
+    而禁忌是安全数据，**改了表却命中旧缓存 = 拿旧名单作答**。
+    取内容哈希后改表即自动失效，不依赖任何人记得 bump 版本号
+    （同 `ingest_cache` 的思路：按内容判重，不按文件名/时间）。
+
+    口径：只哈希「伤病 → (动作, 关系)」的集合，**不含 `reason` 文案**——
+    改错别字不必让缓存全废，但增删任何一条禁忌/康复关系都会换指纹。
+    """
+    import hashlib
+    import json
+
+    payload = sorted(
+        (injury, tuple(sorted((a, rel) for a, rel, _reason in acts)))
+        for injury, acts in INJURY_ACTION_MAP.items()
+    )
+    raw = json.dumps(payload, ensure_ascii=False)
+    return hashlib.md5(raw.encode("utf-8")).hexdigest()[:8]

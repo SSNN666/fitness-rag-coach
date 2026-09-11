@@ -320,7 +320,11 @@ class FitnessRAGRetriever:
             anns_field="embedding",
             search_params={"metric_type": "COSINE", "params": {"nprobe": 10}},
             limit=k,
-            output_fields=["page_content", "metadata_json", "entity_labels"],
+            # 不取 entity_labels 列：它的内容与 metadata_json 内的同名字段**完全重复**
+            # （build_index 写列时就是 json.dumps(metadata["entity_labels"])），
+            # 而下游只读 doc.metadata —— 取回来直接丢弃，纯浪费带宽。
+            # 列本身保留在 schema 里（删列要重建索引，不值当），只是不再回读。
+            output_fields=["page_content", "metadata_json"],
         )
         hits = results[0]  # 只有一个 query vector
         out = []

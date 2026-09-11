@@ -1,5 +1,27 @@
 # 变更记录
 
+## 🧹 2026-09-11 遗留问题清理批次
+
+**前置**：ROADMAP「已知遗留问题」表原有 8 行（图谱超时与融合阈值前一轮已修）。
+动手前**逐条核实**——**6 条里 2 条与表里写的不符**。这个项目反复出现的
+「文档比代码乐观」，这次出现在**待办清单自己身上**。清理后表从 8 行降到 2 行。
+
+| # | 项 | 文件 | 说明 |
+|---|---|---|---|
+| 1 | 回读白费的 Milvus 列 | retriever.py | `entity_labels` 列的内容与 `metadata_json` 内的同名字段**完全重复**（写列时就是 `json.dumps(metadata["entity_labels"])`），而下游只读 `doc.metadata` → 每次查询取回来直接丢弃。从 `output_fields` 移除；列保留在 schema（删列要重建索引，不值当）。实测：`entity_labels` 仍从 `metadata_json` 正常读到，`_entity_match_boost` 不变 |
+| 2 | 孤儿文件 | 仓库根 / .gitignore | 两个陈旧评测快照删除（`eval_results.csv` Hit@1 **0.05**、`eval_results_threepath.csv` **0.15**，7-22 产物，已被 `eval_results/latest.json` 取代——**留着极具误导性**）。`cleanup_c.bat` 经核实是**用户的个人系统脚本**（杀 Docker Desktop + 清 claude 临时目录），非项目产物 → `git rm --cached` 移出版本库、文件留在原地并加进 `.gitignore` |
+| 3 | 死配置 ×2 | config.py / api.py | `SSE_CHUNK_CHARS`（真流式改造后只被 api.py 死导入）、`HYDE_INJURY_KEYWORDS`（hyde 改实体词典贪心抽取后的残留，零引用）。`HYDE_COMPOUND_MARKERS` 是活的，保留 |
+| 4 | **评测与线上不一致**（原判为「死配置」） | pipeline.py / config.py | ⚠️ `RERANKER_DOC_MAX_CHARS` **不是死配置**：reranker 默认 200、config 是 400、`eval_testset` 显式传 400、`pipeline` **没传** → **评测按 400 跑分、线上按 200 跑**。改为 pipeline 显式传 config 值，统一到已发布指标所在的口径。代价：线上 rerank prompt 片段翻倍（用户知情选择） |
+| 5 | **「腰突」重复条目**（原判为可清理） | contra_data.py / tests/ | ⚠️ 原判断「别名归一后永不可达」**只在本地降级路径成立**。图谱路径是活的：`build_index` 按表键建 Entity 节点 → Neo4j 有 `(腰突:injury)` 节点（出边硬拉/深蹲）；而 `_extract_entities('腰突怎么康复')` 返回 `{'injury': ['腰突']}` **不做归一** → 该类问句的图谱检索靠它命中。**删掉会让「腰突」图谱路在重建后失效**。不改数据，加注释 + 回归测试钉住约束 |
+| 6 | `fact_cache` 不含禁忌表变更 | contra_data.py / pipeline.py | `FACT_CACHE_VERSION` 只跟踪提示词；改禁忌表它不动 → 缓存继续吐**按旧禁忌表生成的答案**（安全数据靠「记得手动 bump」不可接受）。新增 `contra_data.data_fingerprint()`：对「伤病 → (动作, 关系)」取 MD5 前 8 位，拼进缓存键 `cd:` 段，改表即自动失效 |
+| 7 | 文档陈旧 | pipeline.py / README.md | `pipeline.py` 类 docstring 仍写「单全局锁串行化」，改为如实描述（四段临界区 + 网络调用尽量排锁外 + 等待/持有分开打点）；README 测试数 143/77 → **302**（并去掉树状图里那份重复数字，避免两处各写一份） |
+| 8 | 测试 | tests/test_contra_data.py（新） | +9 项：指纹稳定性/增删/关系翻转/忽略 reason 文案、缓存键带指纹、「腰突」不可达但**不可删**、别名指向的键必须存在。**293 → 302 通过** |
+
+**明确未动**：`contra_data` 的数据一行未改——第 5 条的真修法（把别名归一补进实体抽取）
+属检索改动，必须重新评测，不在「清理」范围内。
+
+---
+
 ## 🛡️ 2026-09-11 图谱熔断与超时防护
 
 **前置**：ROADMAP「已知遗留问题」记有「图谱不可用时的连接超时」，原文写

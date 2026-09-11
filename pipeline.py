@@ -129,7 +129,16 @@ class PipelineResult:
 # ============================================================
 
 class PipelineService:
-    """12 步安全流水线。单全局锁串行化（Milvus Lite 非线程安全）。"""
+    """12 步安全流水线。
+
+    并发模型：一把全局锁（Milvus Lite 非线程安全）保护四段临界区——
+    A_analyze / C_retrieve / E_budget / F_history。**但网络调用尽量排在锁外**：
+    query embedding（Phase B）与健康工具决策都在锁外做完再传进去，因为云端
+    embedding 单次实测中位 158ms，放锁内等于让所有并发请求排队等这一次 HTTP
+    （实测移出后并发 32 吞吐 878 → 1682 tok/s）。
+    临界区的**等待**与**持有**分开打点（见 `_phase_lock`），用于回答
+    「瓶颈到底是不是这把锁」——只看总延迟分不出这两者。
+    """
 
     def __init__(self, retriever: FitnessRAGRetriever, llms: dict[str, FallbackChain],
                  gateway: Gateway, fact_engine=None, fact_cache=None,
@@ -822,10 +831,16 @@ class PipelineService:
         tool_results 非空时追加画像指纹：同问题不同画像的工具答案不同
         （「帮我算下BMI」在身高170/体重70 与 180/80 下结果不同），不能复用旧缓存。
         """
+        from contra_data import data_fingerprint
+
         names = [n for names in FitnessRAGRetriever._extract_entities(question).values()
                  for n in names]
         names.append(f"mode:{'deep' if deep_thinking else 'fast'}")
         names.append(f"pv:{FACT_CACHE_VERSION}")   # 改提示词后 bump config.FACT_CACHE_VERSION
+        # 禁忌表**内容**指纹：pv 只跟提示词，改 contra_data（增删禁忌）它不动，
+        # 缓存会继续吐按旧禁忌表生成的答案 —— 安全数据不能靠「记得手动 bump」。
+        # 取内容哈希后改表即自动失效（实测：改一条禁忌 → 指纹变化 → 缓存必然 miss）
+        names.append(f"cd:{data_fingerprint()}")
         if tool_results and user_profile:
             import hashlib
             names.append(f"profile:{hashlib.md5(user_profile.encode('utf-8')).hexdigest()[:8]}")
@@ -1114,7 +1129,11 @@ def build_pipeline() -> PipelineService:
         # on_usage 必须挂：rerank 是一次真实的 LLM 调用（伤病/计划层每请求一次）。
         # 原实现漏挂 → 它既不进日志、也不进成本账本，成了唯一一条**不记账的调用路径**，
         # 与 cost_guard.py 里「记账必须挂在所有 LLM 调用的公共漏斗上」的前提直接冲突。
-        reranker = FitnessReranker(llm=build_llm("rerank", on_usage=_bg_usage))
+        # doc_max_chars 必须显式传：reranker 自己的默认值是 200，而 config 里是 400。
+        # 不传 → 线上按 200 跑、eval_testset 按 400 跑，**评测测的不是线上跑的东西**。
+        # 统一到 config 的 400（= 已发布的 Hit@k 指标所在的那个口径）。
+        reranker = FitnessReranker(llm=build_llm("rerank", on_usage=_bg_usage),
+                                   doc_max_chars=RERANKER_DOC_MAX_CHARS)
 
     retriever = FitnessRAGRetriever(
         milvus_client=milvus_client,

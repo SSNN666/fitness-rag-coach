@@ -35,7 +35,7 @@ from pydantic import BaseModel, Field
 import log_reader
 from config import (
     API_KEY_AUTH, FEEDBACK_MAX_RECENT, FEEDBACK_PATH, LLM_PROVIDER_PRIMARY,
-    MAX_QUERY_CHARS, NEO4J_ENABLED, PROMPT_INJECTION_ENABLED, SSE_CHUNK_CHARS,
+    MAX_QUERY_CHARS, NEO4J_ENABLED, PROMPT_INJECTION_ENABLED,
 )
 from content_moderation import build_censor
 from guardrails import detect_injection_multi

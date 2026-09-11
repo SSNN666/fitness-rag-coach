@@ -178,7 +178,7 @@ python bench_stream.py --concurrency 1,2,4 --question "腰突怎么康复"   # �
 ## 🧪 测试
 
 ```bash
-pytest -q tests/                    # 143 项：适配器降级链/注入/拒答/乱码/API 集成/引用清洗/拒绝原因/网关防护/图谱/断连取消/供应商参数隔离/分类器回归/健康工具/多轮改写/禁忌复查/反馈/检索 debugger（mock 打桩）
+pytest -q tests/                    # 302 项：适配器降级链/注入/拒答/乱码/API 集成/引用清洗/拒绝原因/网关防护/图谱/断连取消/供应商参数隔离/分类器回归/健康工具/多轮改写/禁忌复查/反馈/检索 debugger/图谱熔断/禁忌表指纹（mock 打桩）
 python -u eval_graph.py             # 图谱检索专项评测（mock 确定性；--neo4j 切真实实例）
 python -u eval_testset.py --skip-groups --limit 100   # 检索+生成评测（本地 Ollama）
 python -u eval_testset.py --rrf --limit 20            # RRF 融合模式对比
@@ -394,6 +394,7 @@ python mcp_server.py --transport sse
 ├── eval_testset.py        # 评测（适配器统一，--cloud/--rrf/--feedback）
 ├── bench_stream.py        # 并发压测（P50/P95/P99 首 token/总延迟 + token 吞吐）
 ├── config.py              # 全局配置（密钥走 .env）
-├── tests/                 # pytest 77 项
+├── graph_client.py        # 图谱客户端（显式超时 + 熔断，图谱停机不再每请求等 34s）
+├── tests/                 # pytest 单测（项数见「🧪 测试」一节，不在两处各写一份）
 └── eval_results_final.csv # 历史优化记录
 ```
