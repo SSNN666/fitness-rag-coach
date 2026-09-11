@@ -63,7 +63,7 @@ if "deep_thinking" not in st.session_state:
 st.session_state.deep_thinking = st.sidebar.checkbox(
     "深度思考模式",
     value=st.session_state.deep_thinking,
-    help="伤病/计划类问题分析更深入，耗时更长（默认快速模式，回答后会有提示）")
+    help="伤病/计划类问题分析更深入，耗时更长（默认关闭，回答后会有提示）")
 st.sidebar.markdown("---")
 st.sidebar.caption("数据保存后，教练将基于你的画像给出建议。")
 

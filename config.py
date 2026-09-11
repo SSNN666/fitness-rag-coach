@@ -152,7 +152,7 @@ FACT_CACHE_MAX = 200                   # 最多缓存条数
 FACT_CACHE_PATH = os.getenv("FACT_CACHE_PATH", "fact_cache.json")
 # 提示词版本（缓存 key 的一部分）：改动分层 Prompt / 层级 hint 后 bump 此值，
 # 旧缓存自动失效（实测教训：改 600 字约束后重启，旧长回答仍从缓存吐出，新提示词不生效）
-FACT_CACHE_VERSION = 2
+FACT_CACHE_VERSION = 3        # v3：分层 Prompt 禁止正文标注出处（v2 answers 含「依据原文步骤」噪声）
 
 # ============================================================
 # Ollama Engine Configuration (passed per-request to Ollama API)

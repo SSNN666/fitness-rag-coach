@@ -856,3 +856,63 @@ def test_precomputed_vec_reaches_retrieval(monkeypatch):
 
     assert seen and seen[0] is not None, "检索没收到预算好的 query_vec"
     assert seen[0] == [0.1] * 768
+
+
+# ----------------------------------------------------------------
+# Prompt 结构约束（防止「逐行贴出处标签」那类诱导措辞回归）
+# ----------------------------------------------------------------
+
+def test_plan_prompt_forbids_inline_source_annotations():
+    """计划层 Prompt 必须**禁止正文标注出处**，且不得再要求「必须有原文依据」。
+
+    背景（2026-09-11 真实输出）：原文案「每个动作、组数、频率必须在参考知识中有原文依据」
+    被模型执行成了**逐行贴标签**——而它拿不到可引用的粒度（知识库是整条 CSV 行，
+    不是「第 3 步」），于是退化成一句空话「（依据原文步骤）」，一条回答里出现 15 次。
+    要求「内容只能取自参考知识」即可，标注是系统 `_build_citations` 的职责。
+    """
+    from pipeline import PROMPT_PLAN
+
+    assert "禁止标注出处" in PROMPT_PLAN
+    # 会诱发逐行贴标签的措辞
+    assert "必须有原文依据" not in PROMPT_PLAN
+    assert "中有原文依据" not in PROMPT_PLAN
+    # 约束本身不能丢：内容仍须取自参考知识
+    assert "只能取自「参考知识」" in PROMPT_PLAN
+
+
+def test_injury_prompt_forbids_inline_source_annotations():
+    """伤病层同病同治——原文「每条建议必须在参考知识中有原文依据」是同一个诱导。"""
+    from pipeline import PROMPT_INJURY
+
+    assert "禁止标注出处" in PROMPT_INJURY
+    assert "必须有原文依据" not in PROMPT_INJURY
+    assert "中有原文依据" not in PROMPT_INJURY
+    # 具体化要求要保留（原意是「别泛泛而谈」，不是「逐条盖章」）
+    assert "具体动作名" in PROMPT_INJURY
+
+
+class TestModeHintWording:
+    """答后提示的措辞：不得与分层命名撞车。
+
+    `simple / plan / injury` 是**分层**，`deep_thinking` 是**开关**。
+    页脚若写「本次使用快速模式回答」，计划层用户会以为被降级到了简单层——
+    而计划层实际走的是主模型 + 重排 + 校验的完整链路。
+    """
+
+    @staticmethod
+    def _hint(tier, deep):
+        return PipelineService._mode_hint(tier, deep)
+
+    def test_no_fast_mode_word_collision(self):
+        for tier in ("injury", "plan"):
+            h = self._hint(tier, False)
+            assert h, f"{tier} 未开深度思考应有提示"
+            assert "快速模式" not in h, "「快速模式」是分层用词，会误导为降级到 simple 层"
+            assert "深度思考" in h
+
+    def test_simple_tier_has_no_hint(self):
+        assert self._hint("simple", False) == ""
+
+    def test_deep_thinking_has_no_hint(self):
+        for tier in ("injury", "plan", "simple"):
+            assert self._hint(tier, True) == ""
