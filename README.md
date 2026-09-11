@@ -1,4 +1,4 @@
-# 🏋️ 康养知识库智能问答 RAG 系统
+# 🏋️ AI 健身教练 —— 安全约束 RAG 问答系统
 
 > ### 🔗 在线演示：<https://ssnn666.github.io/fitness-rag-coach/>
 > **不用 clone、不用配环境、不用 API Key，点开就能看到各条链路的真实输出**——
