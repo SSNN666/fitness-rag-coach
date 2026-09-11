@@ -202,6 +202,9 @@ def healthz():
         "chat_chain": pipeline._llms["chat"].active_providers,
         "memory_degraded": pipeline._gateway.is_degraded,
         "neo4j_enabled": NEO4J_ENABLED,
+        # 图谱熔断状态：图谱停机时检索路会**安静地**降级到本地副本，
+        # 不暴露出来就没人知道它一直在熔断（state=open 即正在降级）
+        "graph": pipeline._retriever.graph_status(),
         "fusion_mode": pipeline._retriever._fusion_mode,
         # 成本账本：用量与档位（ok / degraded / exhausted）对外可见，
         # 便于在账单异常时立刻定位是「谁在花」还是「花超了」

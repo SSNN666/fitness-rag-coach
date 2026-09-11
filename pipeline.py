@@ -1093,8 +1093,10 @@ def build_pipeline() -> PipelineService:
     bm25_idx, bm25_docs = load_bm25_from_pickle(BM25_INDEX_PATH)
 
     if NEO4J_ENABLED:
-        from neo4j import GraphDatabase
-        neo4j_driver = GraphDatabase.driver(NEO4J_URI, auth=(NEO4J_USER, NEO4J_PASSWORD))
+        # 走 graph_client：显式超时 + 熔断。裸 driver 在图谱停机时单次调用要
+        # 34.53s（实测，驱动默认重试预算吃满），一次伤病问句含 2~3 次调用
+        from graph_client import make_graph_client
+        neo4j_driver = make_graph_client(NEO4J_URI, (NEO4J_USER, NEO4J_PASSWORD))
     else:
         neo4j_driver = None
 

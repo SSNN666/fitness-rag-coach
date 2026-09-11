@@ -164,6 +164,17 @@ class FitnessRAGRetriever:
             return candidates[:top_k]
         return self._reranker.rerank(query, candidates, top_k=top_k)
 
+    def graph_status(self) -> dict | None:
+        """图谱客户端状态（熔断/失败计数）；未启用图谱时 None。
+
+        暴露给 /healthz：**没有这个，线上就不知道图谱正在被降级**——
+        熔断是「安静地降级」，只有指标能让人发现它一直在开着。
+        """
+        if self._neo4j is None:
+            return None
+        snapshot = getattr(self._neo4j, "snapshot", None)
+        return snapshot() if callable(snapshot) else {"state": "unknown"}
+
     def get_contraindications(self, injury_names: list[str]) -> dict[str, list[str]]:
         """
         查询 Neo4j 获取指定伤病 → 禁忌动作/器械映射。

@@ -73,15 +73,38 @@ def _load_from_local() -> dict:
     return _assemble(edges)
 
 
+_client = None          # 模块级复用：熔断状态必须跨调用存活
+_client_failed = False
+
+
+def _get_client():
+    """懒加载带熔断的图谱客户端（不可用时返回 None，调用方回退本地副本）。
+
+    **必须复用而非每次新建**：本函数在每个 Streamlit rerun 都会跑，
+    而熔断状态活在客户端里——按调用新建等于每次都从「正常」重新开始，
+    连续失败永远累加不到阈值，图谱停机时会一直按超时等待（实测
+    verify_connectivity 4.08s/次，每次交互都付）。
+    """
+    global _client, _client_failed
+    if _client is not None or _client_failed:
+        return _client
+    import config as cfg
+    try:
+        from graph_client import make_graph_client
+        _client = make_graph_client(cfg.NEO4J_URI,
+                                    (cfg.NEO4J_USER, cfg.NEO4J_PASSWORD))
+    except Exception:
+        _client_failed = True
+    return _client
+
+
 def _load_from_neo4j() -> dict | None:
     """Cypher 直查图谱（与 build_index 写入的 schema 一致：RELATES_TO + r.relation）。"""
     import config as cfg
+    driver = _get_client()
+    if driver is None:
+        return None
     try:
-        from neo4j import GraphDatabase
-        driver = GraphDatabase.driver(
-            cfg.NEO4J_URI, auth=(cfg.NEO4J_USER, cfg.NEO4J_PASSWORD),
-            connection_timeout=8,
-        )
         driver.verify_connectivity()
         records, _, _ = driver.execute_query(
             "MATCH (i:Entity)-[r:RELATES_TO]->(a:Entity) "
@@ -90,9 +113,8 @@ def _load_from_neo4j() -> dict | None:
             "LIMIT 1000",
             database_=cfg.NEO4J_DATABASE,
         )
-        driver.close()
     except Exception:
-        return None  # 图谱不可用 → 调用方回退本地副本
+        return None  # 图谱不可用 → 调用方回退本地副本（客户端不 close：模块级复用）
 
     # 别名归一：与 _load_from_local 口径一致（图谱按 contra_data 原键建节点，
     # 「腰突」与「腰间盘突出」会同时存在 → 不归一会显示成两个重复伤病节点）

@@ -17,6 +17,12 @@ class _StubLLM:
 class _StubRetriever:
     _fusion_mode = "weighted"
 
+    @staticmethod
+    def graph_status():
+        """与真实 retriever 同接口：healthz 会读它（图谱熔断状态）。"""
+        return {"state": "closed", "consecutive_failures": 0, "retry_in_seconds": 0.0,
+                "total_failures": 0, "total_short_circuits": 0}
+
 
 class _StubPipeline:
     _llms = {"chat": _StubLLM()}
@@ -70,6 +76,8 @@ def test_healthz(client):
     body = r.json()
     assert body["status"] == "ok"
     assert body["chat_chain"] == ["ollama"]
+    # 图谱熔断状态必须可见：熔断是「安静地降级」，不暴露就没人知道它一直开着
+    assert body["graph"]["state"] == "closed"
 
 
 def test_missing_key_401(client):

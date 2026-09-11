@@ -72,6 +72,29 @@ server = MCPServer(
 _retriever = None
 _retriever_error: str | None = None
 
+# get_injury_graph 专用：**必须复用**，不能每次调用新建——
+# 熔断状态活在客户端里，按调用新建等于每次都是「冷启动」，
+# 连续失败永远累加不到阈值，熔断器形同虚设（这是本工具从
+# 「每次开 driver」改成复用客户端的原因，不只是为了省连接）
+_graph_client = None
+_graph_client_error: str | None = None
+
+
+def _get_graph_client():
+    """懒加载并复用带熔断的图谱客户端（图谱不可用时返回 None）。"""
+    global _graph_client, _graph_client_error
+    if _graph_client is not None or _graph_client_error is not None:
+        return _graph_client
+    if not NEO4J_ENABLED:
+        _graph_client_error = "图谱未启用（NEO4J_ENABLED=False）"
+        return None
+    try:
+        from graph_client import make_graph_client
+        _graph_client = make_graph_client(NEO4J_URI, (NEO4J_USER, NEO4J_PASSWORD))
+    except Exception as e:
+        _graph_client_error = f"图谱客户端初始化失败：{e}"
+    return _graph_client
+
 
 def _get_retriever():
     """首次调用时初始化；失败记录原因（不抛异常，让工具返回可读错误）。"""
@@ -90,9 +113,9 @@ def _get_retriever():
         driver = None
         if NEO4J_ENABLED:
             try:
-                from neo4j import GraphDatabase
-                driver = GraphDatabase.driver(
-                    NEO4J_URI, auth=(NEO4J_USER, NEO4J_PASSWORD))
+                # 同 pipeline：显式超时 + 熔断（图谱停机时裸 driver 单次 34.53s）
+                from graph_client import make_graph_client
+                driver = make_graph_client(NEO4J_URI, (NEO4J_USER, NEO4J_PASSWORD))
             except Exception:
                 driver = None      # 图谱不可用不影响其余两路
         _retriever = FitnessRAGRetriever(
@@ -216,9 +239,14 @@ def get_injury_graph(injury: str, max_depth: int = 2) -> str:
     if not NEO4J_ENABLED:
         return ("图谱未启用（NEO4J_ENABLED=False），无法查询多跳关系；"
                 "可改用 check_contraindication 查本地禁忌副本。")
+    driver = _get_graph_client()
+    if driver is None:
+        return (f"图谱客户端不可用（{_graph_client_error}）；"
+                f"可改用 check_contraindication 查本地禁忌副本。")
     try:
-        from neo4j import GraphDatabase
-        driver = GraphDatabase.driver(NEO4J_URI, auth=(NEO4J_USER, NEO4J_PASSWORD))
+        # 走 graph_client 的 execute_query（原为 driver.session + s.run）：
+        # 换掉的理由不只是超时/熔断——session 路径是四处图谱调用里唯一不走
+        # execute_query 的，口径不一致，改成同一个入口便于统一防护与观测
         depth = max(1, min(int(max_depth), 3))
         cypher = f"""
             MATCH path = (s:Entity {{name: $name}})-[*1..{depth}]->(e:Entity)
@@ -227,9 +255,10 @@ def get_injury_graph(injury: str, max_depth: int = 2) -> str:
                    length(path) AS hops
             ORDER BY hops ASC LIMIT 30
         """
-        with driver.session(database=NEO4J_DATABASE) as s:
-            recs = list(s.run(cypher, name=_canon(injury)))
-        driver.close()
+        # 不 close：客户端是模块级复用的（熔断状态要跨调用存活），
+        # 每次 close 会让连接池重建、并丢掉熔断器累积的失败计数
+        recs, _, _ = driver.execute_query(
+            cypher, {"name": _canon(injury)}, database_=NEO4J_DATABASE)
     except Exception as e:
         return f"图谱查询失败：{e}（图谱不可用时可改用 check_contraindication）"
 

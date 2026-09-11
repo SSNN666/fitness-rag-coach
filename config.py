@@ -64,6 +64,16 @@ NEO4J_USER = os.getenv("NEO4J_USER", "")
 NEO4J_PASSWORD = os.getenv("NEO4J_PASSWORD", "")  # 密钥位于 .env，勿硬编码
 NEO4J_DATABASE = os.getenv("NEO4J_DATABASE", "neo4j")
 
+# --- 图谱不可用时的延迟防护（详见 graph_client.py；实测数字见 ROADMAP）---
+# 不加防护时单次 execute_query 实测 **34.53s**（驱动默认 max_transaction_retry_time=30s
+# 的重试退避吃满），而热路径建 driver 时从未传过任何超时参数。
+NEO4J_CONNECTION_TIMEOUT = 3.0        # TCP 连接超时（驱动默认 30s）
+NEO4J_MAX_RETRY_TIME = 0.0            # 事务重试总预算（驱动默认 30s ← 34.5s 的真凶）
+                                      # 设 0 = 不重试：调用方已有完整的本地降级副本，
+                                      # 请求内重试只加延迟、不改变结果
+NEO4J_BREAKER_FAIL_THRESHOLD = 3      # 连续失败 N 次 → 熔断打开
+NEO4J_BREAKER_COOLDOWN = 30.0         # 打开后冷却 T 秒 → 半开探测一次
+
 # ============================================================
 # BM25 关键词检索（纯 Python rank-bm25）
 # ============================================================
