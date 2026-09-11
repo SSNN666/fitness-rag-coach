@@ -7,13 +7,13 @@
 >
 > ⚠️ 那是**离线快照**（`docs/` 由 `build_demo.py` 跑完整管线导出），不是实时服务。
 
-基于检索增强生成（RAG）的康养问答 Demo：**FastAPI 唯一后端 + Streamlit SSE 客户端**，Milvus 向量 + BM25 关键词双路检索（Neo4j 图谱可插拔），统一大模型适配器（云端主链路 + 多供应商降级），HyDE 查询改写、拒答判定、Prompt 注入检测、内容审核、完整日志。
+基于检索增强生成（RAG）的康养问答 Demo：**FastAPI 唯一后端 + Streamlit SSE 客户端**，Milvus 向量 + BM25 关键词 + Neo4j 图谱**三路检索**，统一大模型适配器（云端主链路 + 多供应商降级），HyDE 查询改写、拒答判定、Prompt 注入检测、内容审核、完整日志。
 
 ## ✨ 核心特性
 
 - **统一大模型适配器**：主链路阿里云百炼 DashScope（MaaS 部署 qwen3.7-plus，`DASHSCOPE_BASE_URL` 可切公共云/私有化），DeepSeek / 千帆 ERNIE 可选，本地 Ollama 兜底；超时/429 限流（按 Retry-After 退避）/额度不足/上下文超长自动分类 → 重试退避 → 降级链
 - **分层生成策略**：按查询复杂度分配模型与预算——简单问题快模型 + 短预算 + 跳过重排（**实测中位 3.2s**），伤病/计划问题主模型 + LLM 重排 + Fact-Check（**实测中位 4.8s**）；深度思考为**用户可选**，开启后走思考模式（**实测 64.8s**，耗时约 13 倍，故默认关闭）；混合思考开关按角色配置（短回答类任务关思考提速 17 倍）
-- **双路检索 + 图谱可插拔**：Milvus Lite 语义向量 + BM25 关键词，RRF / 加权融合双模式可切换；Neo4j 伤病禁忌图谱默认停用、config 一键切回三路
+- **三路检索与融合**：Milvus Lite 语义向量 + BM25 关键词 + Neo4j 伤病禁忌图谱，RRF / 加权融合双模式可切换；图谱**默认启用**（本地 Docker 实例）——config 置 `NEO4J_ENABLED=False` 即停用并回退双路，禁忌自动走 `contra_data.py` 本地副本
 - **安全流水线（12 步）**：实体抽取 → 禁忌黑名单 → 边界拒绝 → HyDE 检索 → CRAG 补盲 → **拒答判定** → 分层 Prompt → 令牌预算 → 降级链生成 → 硬性过滤 → Fact-Check → 结构化引用
 - **禁忌数据双源降级**：Neo4j 图谱停机时自动切 [contra_data.py](contra_data.py) 本地副本（28 类伤病禁忌，与图谱构建共用单一数据源）——核心安全数据不依赖单一外部服务
 - **接口层防护**：X-API-Key 鉴权（演示级）、Prompt 注入检测（规则加权）、百度内容审核（输入/输出双向，fail-open）
@@ -36,7 +36,7 @@
 | Embedding | qwen3.7-text-embedding（云端，768d 指定维度）+ nomic-embed-text（本地兜底） |
 | 向量库 | Milvus Lite（嵌入式，单进程独占） |
 | 关键词 | BM25（rank-bm25 + jieba） |
-| 知识图谱 | Neo4j AuraDB（伤病→禁忌/康复，默认停用可插拔） |
+| 知识图谱 | Neo4j 5（本地 Docker 实例；伤病→禁忌/康复，195 节点 / 337 关系） |
 | API | FastAPI + Pydantic + SSE；Streamlit（纯 API 客户端） |
 | 内容审核 | 百度智能云 text_censor/v2 |
 | 评估 | 自研 LLM-judge（Hit@k / MRR / faithfulness / relevancy / precision / recall） |
@@ -55,7 +55,7 @@
                                                       ┌───────────────────▼───────────────────┐
                                                       │ pipeline.py PipelineService（12 步）   │
                                                       │  实体→禁忌(Neo4j可选)→边界拒绝→        │
-                                                      │  HyDE双路检索→CRAG→拒答→分层Prompt→    │
+                                                      │  HyDE三路检索→CRAG→拒答→分层Prompt→    │
                                                       │  预算守卫→生成→硬过滤→FactCheck→引用    │
                                                       └───┬───────────────┬───────────────────┘
                                             ┌─────────────▼──────┐  ┌─────▼──────────────────────┐
@@ -66,7 +66,7 @@
                                             └─────────────────────┘
 ```
 
-**完整请求链路**：X-API-Key → Prompt 注入检测 → 百度输入审核（流式前）→ 网关限流/降噪 → 实体抽取 → Neo4j 禁忌名单（停用时安全跳过）→ 边界拒绝检查 → 多轮改写（指代消解，仅检索）→ HyDE + 双路检索（加权/RRF 融合 + 实体 boost + LLM 重排）→ 知识盲区 CRAG 联网 → grounding 拒答判定（生成前）→ 分层 Prompt + 禁忌注入 + 工具计算结果（BMI/饮水量/心率，确定性计算）→ 令牌预算级联截断 → 降级链生成 → 硬性禁忌过滤 → Fact-Check 四类校验（缓存 + CRAG 修正）→ 百度输出审核（展示前）→ 结构化引用 → SSE 分块输出。
+**完整请求链路**：X-API-Key → Prompt 注入检测 → 百度输入审核（流式前）→ 网关限流/降噪 → 实体抽取 → Neo4j 禁忌名单（停用时安全跳过）→ 边界拒绝检查 → 多轮改写（指代消解，仅检索）→ HyDE + 三路检索（加权/RRF 融合 + 实体 boost + LLM 重排）→ 知识盲区 CRAG 联网 → grounding 拒答判定（生成前）→ 分层 Prompt + 禁忌注入 + 工具计算结果（BMI/饮水量/心率，确定性计算）→ 令牌预算级联截断 → 降级链生成 → 硬性禁忌过滤 → Fact-Check 四类校验（缓存 + CRAG 修正）→ 百度输出审核（展示前）→ 结构化引用 → SSE 分块输出。
 
 ## 📦 安装
 
@@ -122,7 +122,7 @@ curl "http://127.0.0.1:8000/v1/debug/retrieval?request_id=<request_id>" -H "X-AP
 | QIANFAN_API_KEY | 可选第二云供应商（ERNIE） | 降级链自动跳过 |
 | BAIDU_AK / BAIDU_SK | 百度内容审核（text_censor/v2） | NullCensor 直通放行 + 日志标注 |
 | API_KEY_AUTH | 接口鉴权 Key（自定字符串） | 空 = 本地免鉴权 |
-| NEO4J_PASSWORD | Neo4j AuraDB（NEO4J_ENABLED=True 时） | — |
+| NEO4J_URI / NEO4J_USER / NEO4J_PASSWORD | 本地 Neo4j 实例（`NEO4J_ENABLED=True` 时；容器 `neo4j-fitness`） | 连不上时自动降级到本地禁忌副本 |
 | BOCHA_API_KEY | CRAG 联网搜索 | 联网补盲降级为无外部资料 |
 
 ## ⚡ 分层生成策略（按复杂度分配生成时间）
@@ -178,7 +178,7 @@ python bench_stream.py --concurrency 1,2,4 --question "腰突怎么康复"   # �
 ## 🧪 测试
 
 ```bash
-pytest -q tests/                    # 302 项：适配器降级链/注入/拒答/乱码/API 集成/引用清洗/拒绝原因/网关防护/图谱/断连取消/供应商参数隔离/分类器回归/健康工具/多轮改写/禁忌复查/反馈/检索 debugger/图谱熔断/禁忌表指纹（mock 打桩）
+pytest -q tests/                    # 307 项（2026-09-11 快照值；跑一次即得当前值）：适配器降级链/注入/拒答/乱码/API 集成/引用清洗/拒绝原因/网关防护/图谱/断连取消/供应商参数隔离/分类器回归/健康工具/多轮改写/禁忌复查/反馈/检索 debugger/图谱熔断/禁忌表指纹（mock 打桩）
 python -u eval_graph.py             # 图谱检索专项评测（mock 确定性；--neo4j 切真实实例）
 python -u eval_testset.py --skip-groups --limit 100   # 检索+生成评测（本地 Ollama）
 python -u eval_testset.py --rrf --limit 20            # RRF 融合模式对比
@@ -360,7 +360,6 @@ python mcp_server.py --transport sse
 ```
 ├── CHANGELOG.md           # 变更记录（2026-08-13 康养 Demo 改造日全记录）
 ├── ROADMAP.md             # 当前状态与后续计划（防上下文丢失）
-├── INTERVIEW_STORIES.md   # 面试故事集（11 个故事 + 讲法 + 追问预案）
 ├── CONTEXT_MANAGEMENT.md  # 上下文管理设计（预算/级联截断/头部保留）
 ├── mcp_server.py          # MCP Server：把检索/禁忌判定/图谱/计算暴露给其他 Agent
 ├── session_store.py       # 会话记忆持久化（JSON 原子写，跨重启恢复）
@@ -378,7 +377,7 @@ python mcp_server.py --transport sse
 ├── content_moderation.py  # 百度内容审核（fail-open）
 ├── grounding.py           # 知识库依据判定（无依据拒答）
 ├── text_quality.py        # OCR 乱码质检（摄入层）
-├── retriever.py           # 双路检索 + weighted/RRF 融合 + [Neo4j 可插拔]
+├── retriever.py           # 三路检索 + weighted/RRF 融合 + 实体 boost
 ├── reranker.py            # LLM listwise 重排序
 ├── hyde.py                # HyDE + Step-Back + 问题分解 + 多轮改写
 ├── health_tools.py        # 确定性健康工具层（BMI/饮水量/心率区间，注册表结构）
